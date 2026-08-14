@@ -71,14 +71,15 @@ async function analyze(jobId: string, video: any) {
     updateJob(jobId, 15, '代表フレームを抽出しています');
     const folder = join(framesRoot, video.id); mkdirSync(folder, { recursive: true });
     // 短い動画でも内容の変化を追えるよう、最低6枚は抽出する。
-    const count = Math.max(6, Math.min(12, Math.ceil(duration / 15)));
+    //const count = Math.max(6, Math.min(12, Math.ceil(duration / 15)));  // これだと、最高12カウントになる。
+    const count = Math.max(6,  Math.ceil(duration / 15));
     const interval = Math.max(1, duration / count);
     await command('ffmpeg', ['-y', '-i', video.path, '-vf', `fps=1/${interval},scale='min(1280,iw)':-2`, '-frames:v', String(count), join(folder, 'frame-%03d.jpg')]);
     const { readdirSync, readFileSync } = await import('node:fs'); const files = readdirSync(folder).filter(x=>x.endsWith('.jpg')).sort();
     updateJob(jobId, 35, `LM Studioへ${files.length}枚のフレームを送信しています`);
     const base = getSetting('lmstudio_url', 'http://127.0.0.1:1234/v1').replace(/\/$/, ''); const model = getSetting('lmstudio_model', '').trim();
     if (!model) throw new Error('LM StudioのVision対応モデルを設定画面で選択してください');
-    const prompt = `あなたは作業映像の監査担当です。以下の動画から一定間隔で抽出したフレームを時系列順に観察し、確認できる事実だけを日本語で抽出してください。動画は${duration.toFixed(1)}秒、フレーム数は${files.length}です。各フレームはおおよそ ${interval.toFixed(1)} 秒間隔です。映像に人物、画面、物体、操作が映っている場合は、少なくともそれらを時系列イベントとして記録してください。必ずJSONのみを返してください。形式: {"events":[{"start_time":秒数,"end_time":秒数またはnull,"event_type":"operation|inspection|movement|issue|other","description":"確認できる簡潔な事実","objects":["対象"],"confidence":0から1,"frame_index":1始まりの番号}]}。`;
+    const prompt = `あなたは作業映像の監査担当です。以下の動画から一定間隔で抽出したフレームを時系列順に観察し、確認できる事実だけを日本語で詳細に抽出してください。動画は${duration.toFixed(1)}秒、フレーム数は${files.length}です。各フレームはおおよそ ${interval.toFixed(1)} 秒間隔です。映像に人物、画面、物体、操作が映っている場合は、少なくともそれらを時系列イベントとして記録してください。必ずJSONのみを返してください。形式: {"events":[{"start_time":秒数,"end_time":秒数またはnull,"event_type":"operation|inspection|movement|issue|other","description":"確認できる事実","objects":["対象"],"confidence":0から1,"frame_index":1始まりの番号}]}。`;
     const content: any[] = [{ type: 'text', text: prompt }];
     for (const file of files) content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${readFileSync(join(folder,file)).toString('base64')}` } });
     const response = await fetch(`${base}/chat/completions`, { method: 'POST', headers: lmStudioHeaders(), body: JSON.stringify({ model, temperature: 0.1, response_format: { type: 'json_schema', json_schema: { name: 'video_events', schema: { type: 'object', additionalProperties: false, required: ['events'], properties: { events: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['start_time', 'end_time', 'event_type', 'description', 'objects', 'confidence', 'frame_index'], properties: { start_time: { type: 'number' }, end_time: { type: ['number', 'null'] }, event_type: { type: 'string' }, description: { type: 'string' }, objects: { type: 'array', items: { type: 'string' } }, confidence: { type: 'number' }, frame_index: { type: 'integer' } } } } } } } }, messages: [{ role:'user', content }] }) });
@@ -113,7 +114,7 @@ app.post('/api/videos/:id/report', async (req,res) => {
   if(!video) return res.sendStatus(404); if(!events.length) return res.status(400).json({error:'先にイベントを解析してください'});
   const base=getSetting('lmstudio_url','').replace(/\/$/,''); const model=getSetting('lmstudio_model','').trim();
   const compact=events.map(e=>({time:e.start_time,description:e.description,type:e.event_type,confidence:e.confidence}));
-  const prompt=`以下の観測イベントだけを根拠に、簡潔な日本語の作業報告書をMarkdownで作成してください。推測は書かず、不確実な事実は明記してください。見出しは「作業概要」「時系列の作業内容」「異常・留意事項」「根拠」。動画名: ${video.name}\nイベント: ${JSON.stringify(compact)}`;
+  const prompt=`以下の観測イベントだけを根拠に、詳細な日本語の作業報告書をMarkdownで作成してください。推測は書かず、不確実な事実は明記してください。見出しは「作業概要」「時系列の作業内容」「異常・留意事項」「根拠」。動画名: ${video.name}\nイベント: ${JSON.stringify(compact)}`;
   let markdown=''; let fallbackReason='';
   try {
     if (!model) throw new Error('LM Studioのモデルが未選択です');
