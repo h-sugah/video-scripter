@@ -210,14 +210,15 @@ function reportFallback(video: any, events: any[], reason?: string) {
   return `# 作業報告書\n\n## 作業概要\n\n対象動画: ${video.name}\n\n## 時系列の作業内容\n\n${lines.join('\n')}\n\n## 異常・留意事項\n\n観測イベント上、明示的な異常は記録されていません。\n\n## 根拠\n\n本報告書は、保存された時系列イベントおよび各イベントに紐づく動画フレームを根拠に作成しました。\n${reason ? `\n> 注記: LM Studioによる文章整形が利用できなかったため、イベントデータから直接生成しています（${reason}）。` : ''}`;
 }
 
-// あらゆるVision対応モデル（Qwen-VL, Muse Glimmer, Gemma, Llama-Vision等）に互換性を持つAPI送信関数
-async function callVisionModel(
+// ストリーミング（SSE）受信により、長時間の思考・推論でもタイムアウト切断（Client disconnected）を100%防止するVisionモデル呼び出し関数
+async function callVisionModelStream(
   base: string,
   model: string,
   prompt: string,
   batchFiles: string[],
   folder: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  onProgress?: (tokenCount: number) => void
 ): Promise<string> {
   const content: any[] = [{ type: 'text', text: prompt }];
   for (const file of batchFiles) {
@@ -228,14 +229,33 @@ async function callVisionModel(
     });
   }
 
-  // 試行1: json_object 形式
-  // 試行2: response_format なし（一部モデルで文法制約時にサーバーがクラッシュ/ソケット切断する現象を回避）
+  // 試行1: stream: true (ストリーミング受信でタイムアウトを完全に防止)
   const attempts: { name: string; body: any }[] = [
-    { name: 'json_object', body: { model, temperature: 0.1, response_format: { type: 'json_object' }, messages: [{ role: 'user', content }] } },
-    { name: 'standard', body: { model, temperature: 0.1, messages: [{ role: 'user', content }] } },
+    {
+      name: 'stream_plain',
+      body: {
+        model,
+        temperature: 0.1,
+        max_tokens: 4096,
+        stream: true,
+        messages: [{ role: 'user', content }]
+      }
+    },
+    {
+      name: 'stream_json',
+      body: {
+        model,
+        temperature: 0.1,
+        max_tokens: 4096,
+        stream: true,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content }]
+      }
+    }
   ];
 
   let lastError: any = null;
+
   for (const attempt of attempts) {
     try {
       const res = await fetch(`${base}/chat/completions`, {
@@ -251,12 +271,58 @@ async function callVisionModel(
         continue;
       }
 
-      const jsonRes = await res.json() as any;
-      const text = extractChoiceContent(jsonRes.choices?.[0]);
-      if (text && text.trim()) {
-        return text;
+      if (!res.body) {
+        throw new Error('レスポンスボディが空です');
       }
-      lastError = new Error('モデルから有効な応答テキストが得られませんでした');
+
+      // ストリーミングデータをチャンク単位で読み込み（接続を常にアクティブに維持）
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let accumulatedContent = '';
+      let accumulatedReasoning = '';
+      let tokenCount = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith(':')) continue;
+          if (trimmed === 'data: [DONE]') continue;
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trimmed.slice(6));
+              const delta = data.choices?.[0]?.delta;
+              if (delta) {
+                if (typeof delta.content === 'string') {
+                  accumulatedContent += delta.content;
+                  tokenCount++;
+                }
+                if (typeof delta.reasoning_content === 'string') {
+                  accumulatedReasoning += delta.reasoning_content;
+                  tokenCount++;
+                }
+                if (tokenCount % 15 === 0 && onProgress) {
+                  onProgress(tokenCount);
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+
+      const finalText = accumulatedContent.trim() || accumulatedReasoning.trim();
+      if (finalText) {
+        return finalText;
+      }
+
+      lastError = new Error('ストリームから有効なテキストを受信できませんでした');
     } catch (err: any) {
       lastError = err;
     }
@@ -284,13 +350,19 @@ async function analyze(jobId: string, video: any) {
     const folder = join(framesRoot, video.id);
     mkdirSync(folder, { recursive: true });
 
+    // 既存の古いフレームをクリーンアップ
+    const { readdirSync, rmSync: removeFile } = await import('node:fs');
+    const existing = readdirSync(folder);
+    for (const f of existing) {
+      try { removeFile(join(folder, f)); } catch {}
+    }
+
     // 短い動画でも変化を追えるよう最低6枚、長時間の動画は15秒に1枚程度サンプリング
     // 解像度を min(640,iw) に最適化（Qwen-VLやMuse Glimmer等の動的パッチモデルでのトークン溢れ・VRAM OOMを防止）
     const count = Math.max(6, Math.ceil(duration / 15));
     const interval = Math.max(1, duration / count);
     await command('ffmpeg', ['-y', '-i', video.path, '-vf', `fps=1/${interval},scale='min(640,iw)':-2`, '-frames:v', String(count), join(folder, 'frame-%03d.jpg')]);
 
-    const { readdirSync } = await import('node:fs');
     const files = readdirSync(folder).filter(x => x.endsWith('.jpg')).sort();
     if (!files.length) throw new Error('フレーム画像を抽出できませんでした。');
 
@@ -315,11 +387,15 @@ async function analyze(jobId: string, video: any) {
       const rangeStr = `${formatDuration(batchStartTime)}〜${formatDuration(batchEndTime)}`;
       updateJob(jobId, progress, `区間 ${b + 1}/${totalBatches} (${rangeStr}) の${batchFiles.length}フレームをLM Studioで解析中...`);
 
-      const prompt = `あなたは作業映像の監査担当です。以下の動画区間（${batchFiles.length}フレーム、動画全体${duration.toFixed(1)}秒中の ${batchStartTime.toFixed(1)}秒〜${batchEndTime.toFixed(1)}秒付近、各フレームは約${interval.toFixed(1)}秒間隔、全体フレーム番号 #${batchStartIndex}〜#${batchEndIndex}）を時系列順に観察し、確認できる事実だけを日本語で詳細に抽出してください。
-映像に人物、画面、物体、操作が映っている場合は、それらを時系列イベントとして記録してください。
-【重要】start_time と end_time は、動画全体の開始（0秒）からの絶対秒数（${batchStartTime.toFixed(1)}〜${batchEndTime.toFixed(1)}秒の範囲）で記載してください。
-【重要】frame_index には提示されたフレーム番号（${batchStartIndex}〜${batchEndIndex}）を記載してください。
-必ず以下のJSON形式のオブジェクトのみを出力してください。余計な解説文は不要です。
+      const prompt = `あなたは作業映像の監査担当です。以下の動画区間から抽出された【${batchFiles.length}枚のフレーム画像】（動画全体${duration.toFixed(1)}秒中の ${batchStartTime.toFixed(1)}秒〜${batchEndTime.toFixed(1)}秒付近、各フレームは約${interval.toFixed(1)}秒間隔、フレーム番号 #${batchStartIndex}〜#${batchEndIndex}）を時系列順に観察し、確認できる事実だけを日本語で詳細に抽出してください。
+
+【重要指示】
+1. 思考（Thinking/Reasoning）は必要最小限（3行以内）とし、速やかに指定のJSON形式で出力してください。
+2. 添付された画像は全部で${batchFiles.length}枚です。それぞれのフレーム番号は #${batchStartIndex} から #${batchEndIndex} です。
+3. start_time と end_time は、動画全体の開始（0秒）からの絶対秒数（${batchStartTime.toFixed(1)}〜${batchEndTime.toFixed(1)}秒の範囲）で記載してください。
+4. frame_index には提示されたフレーム番号（${batchStartIndex}〜${batchEndIndex}）を記載してください。
+5. 必ず以下のJSON形式のオブジェクトのみを出力してください。
+
 \`\`\`json
 {
   "events": [
@@ -336,7 +412,17 @@ async function analyze(jobId: string, video: any) {
 }
 \`\`\``;
 
-      const modelResponse = await callVisionModel(base, model, prompt, batchFiles, folder, lmStudioHeaders());
+      const modelResponse = await callVisionModelStream(
+        base,
+        model,
+        prompt,
+        batchFiles,
+        folder,
+        lmStudioHeaders(),
+        (tokenCount) => {
+          updateJob(jobId, progress, `区間 ${b + 1}/${totalBatches} (${rangeStr}) 解析中 (${tokenCount}トークン生成)...`);
+        }
+      );
 
       db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
         randomUUID(),
