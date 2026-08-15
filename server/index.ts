@@ -148,7 +148,6 @@ function parseModelJson(rawText: string): any {
       return JSON.parse(candidate);
     } catch {
       try {
-        // 末尾カンマや制御文字の補正
         const repaired = candidate.replace(/,\s*([\}\]])/g, '$1').replace(/[\u0000-\u001F]+/g, ' ');
         return JSON.parse(repaired);
       } catch {}
@@ -211,6 +210,63 @@ function reportFallback(video: any, events: any[], reason?: string) {
   return `# 作業報告書\n\n## 作業概要\n\n対象動画: ${video.name}\n\n## 時系列の作業内容\n\n${lines.join('\n')}\n\n## 異常・留意事項\n\n観測イベント上、明示的な異常は記録されていません。\n\n## 根拠\n\n本報告書は、保存された時系列イベントおよび各イベントに紐づく動画フレームを根拠に作成しました。\n${reason ? `\n> 注記: LM Studioによる文章整形が利用できなかったため、イベントデータから直接生成しています（${reason}）。` : ''}`;
 }
 
+// あらゆるVision対応モデル（Qwen-VL, Muse Glimmer, Gemma, Llama-Vision等）に互換性を持つAPI送信関数
+async function callVisionModel(
+  base: string,
+  model: string,
+  prompt: string,
+  batchFiles: string[],
+  folder: string,
+  headers: Record<string, string>
+): Promise<string> {
+  const content: any[] = [{ type: 'text', text: prompt }];
+  for (const file of batchFiles) {
+    const b64 = readFileSync(join(folder, file)).toString('base64');
+    content.push({
+      type: 'image_url',
+      image_url: { url: `data:image/jpeg;base64,${b64}` }
+    });
+  }
+
+  // 試行1: json_object 形式
+  // 試行2: response_format なし（一部モデルで文法制約時にサーバーがクラッシュ/ソケット切断する現象を回避）
+  const attempts: { name: string; body: any }[] = [
+    { name: 'json_object', body: { model, temperature: 0.1, response_format: { type: 'json_object' }, messages: [{ role: 'user', content }] } },
+    { name: 'standard', body: { model, temperature: 0.1, messages: [{ role: 'user', content }] } },
+  ];
+
+  let lastError: any = null;
+  for (const attempt of attempts) {
+    try {
+      const res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers,
+        keepalive: true,
+        body: JSON.stringify(attempt.body),
+      });
+
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => '');
+        lastError = new Error(`HTTP ${res.status}: ${errorText}`);
+        continue;
+      }
+
+      const jsonRes = await res.json() as any;
+      const text = extractChoiceContent(jsonRes.choices?.[0]);
+      if (text && text.trim()) {
+        return text;
+      }
+      lastError = new Error('モデルから有効な応答テキストが得られませんでした');
+    } catch (err: any) {
+      lastError = err;
+    }
+  }
+
+  const causeDetail = lastError?.cause?.message || lastError?.cause?.code || '';
+  const detail = causeDetail ? ` (${causeDetail})` : '';
+  throw new Error(`${lastError?.message || 'LM Studioへの接続に失敗しました'}${detail}`);
+}
+
 async function analyze(jobId: string, video: any) {
   try {
     updateJob(jobId, 5, '動画情報を確認しています');
@@ -229,11 +285,12 @@ async function analyze(jobId: string, video: any) {
     mkdirSync(folder, { recursive: true });
 
     // 短い動画でも変化を追えるよう最低6枚、長時間の動画は15秒に1枚程度サンプリング
+    // 解像度を min(640,iw) に最適化（Qwen-VLやMuse Glimmer等の動的パッチモデルでのトークン溢れ・VRAM OOMを防止）
     const count = Math.max(6, Math.ceil(duration / 15));
     const interval = Math.max(1, duration / count);
-    await command('ffmpeg', ['-y', '-i', video.path, '-vf', `fps=1/${interval},scale='min(1280,iw)':-2`, '-frames:v', String(count), join(folder, 'frame-%03d.jpg')]);
+    await command('ffmpeg', ['-y', '-i', video.path, '-vf', `fps=1/${interval},scale='min(640,iw)':-2`, '-frames:v', String(count), join(folder, 'frame-%03d.jpg')]);
 
-    const { readdirSync, readFileSync } = await import('node:fs');
+    const { readdirSync } = await import('node:fs');
     const files = readdirSync(folder).filter(x => x.endsWith('.jpg')).sort();
     if (!files.length) throw new Error('フレーム画像を抽出できませんでした。');
 
@@ -241,8 +298,8 @@ async function analyze(jobId: string, video: any) {
     const model = getSetting('lmstudio_model', '').trim();
     if (!model) throw new Error('LM StudioのVision対応モデルを設定画面で選択してください');
 
-    // 長時間動画でもVRAM制限・タイムアウトを回避するため、区間（バッチ）に分割して順次解析
-    const BATCH_SIZE = 8;
+    // 1バッチあたり4フレーム（約1,200〜1,500トークン）でコンテキスト長2048〜4096のモデルでも安全に動作
+    const BATCH_SIZE = 4;
     const totalBatches = Math.ceil(files.length / BATCH_SIZE);
     const allEvents: any[] = [];
 
@@ -279,32 +336,7 @@ async function analyze(jobId: string, video: any) {
 }
 \`\`\``;
 
-      const content: any[] = [{ type: 'text', text: prompt }];
-      for (const file of batchFiles) {
-        content.push({
-          type: 'image_url',
-          image_url: { url: `data:image/jpeg;base64,${readFileSync(join(folder, file)).toString('base64')}` }
-        });
-      }
-
-      const response = await fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers: lmStudioHeaders(),
-        keepalive: true,
-        body: JSON.stringify({
-          model,
-          temperature: 0.1,
-          response_format: { type: 'json_object' },
-          messages: [{ role: 'user', content }]
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(`LM Studioの応答 (区間 ${b + 1}/${totalBatches}): ${response.status} ${await response.text()}`);
-      }
-
-      const jsonRes = await response.json() as any;
-      const modelResponse = extractChoiceContent(jsonRes.choices?.[0]);
+      const modelResponse = await callVisionModel(base, model, prompt, batchFiles, folder, lmStudioHeaders());
 
       db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
         randomUUID(),
@@ -312,7 +344,7 @@ async function analyze(jobId: string, video: any) {
         `perception_batch_${b + 1}_of_${totalBatches}`,
         model,
         prompt,
-        String(modelResponse || JSON.stringify(jsonRes)),
+        String(modelResponse),
         now()
       );
 
@@ -320,14 +352,12 @@ async function analyze(jobId: string, video: any) {
       const batchEvents = normalizeEvents(parsed);
 
       for (const ev of batchEvents) {
-        // frame_index の正規化（ローカル番号 1..N を返した場合は全体番号に変換）
         let fIdx = Number(ev.frame_index) || batchStartIndex;
         if (fIdx >= 1 && fIdx <= batchFiles.length && fIdx < batchStartIndex) {
           fIdx = batchStartIndex + fIdx - 1;
         }
         fIdx = Math.max(1, Math.min(files.length, fIdx));
 
-        // start_time / end_time の補正（区間先頭からの相対秒数の場合を動画絶対秒数へ）
         let st = seconds(ev.start_time);
         if (st < batchStartTime && (st + batchStartTime) <= (batchEndTime + interval * 2)) {
           st = st + batchStartTime;
@@ -374,7 +404,8 @@ async function analyze(jobId: string, video: any) {
 
     updateJob(jobId, 100, `${allEvents.length}件のイベントを抽出しました`, 'completed');
   } catch (error: any) {
-    updateJob(jobId, 0, `${error.message}。FFmpegとLM Studioの起動・設定を確認してください。`, 'failed');
+    const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
+    updateJob(jobId, 0, `${error.message}${cause}。FFmpegとLM Studioの起動・モデル設定を確認してください。`, 'failed');
   }
 }
 
@@ -396,7 +427,8 @@ app.post('/api/lmstudio/test', async (_req, res) => {
     const models = [...new Set((body.data ?? []).map((item: any) => String(item.id)).filter(Boolean))];
     res.json({ models });
   } catch (error: any) {
-    res.status(502).json({ error: `LM Studioへ接続できません: ${error.message}` });
+    const cause = error?.cause ? ` (${error.cause.message || error.cause.code || ''})` : '';
+    res.status(502).json({ error: `LM Studioへ接続できません: ${error.message}${cause}` });
   }
 });
 
