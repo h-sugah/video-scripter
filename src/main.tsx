@@ -64,6 +64,26 @@ function App() {
     }
   }, []);
 
+  const openVideo = useCallback(async (id: string, autoOpenLatestReport = false) => {
+    setVideoId(id);
+    const d = await api('/videos/' + id);
+    setEvents(d.events);
+    setReports(d.reports);
+    const latestJob = d.jobs?.[0];
+    setJob(latestJob);
+
+    if (autoOpenLatestReport && d.reports?.[0]) {
+      const fullReport = await api('/reports/' + d.reports[0].id);
+      setReport(fullReport);
+    }
+
+    if (latestJob && ['queued', 'running'].includes(latestJob.status)) {
+      subscribeJob(latestJob.id, id);
+    } else {
+      closeStream();
+    }
+  }, [closeStream]);
+
   const subscribeJob = useCallback((targetJobId: string, targetVideoId: string) => {
     closeStream();
     const stream = new EventSource('/api/jobs/' + targetJobId + '/stream');
@@ -76,7 +96,8 @@ function App() {
         if (['completed', 'failed'].includes(next.status)) {
           closeStream();
           if (next.status === 'completed') {
-            openVideo(targetVideoId);
+            const isReportJob = typeof next.message === 'string' && next.message.includes('報告書');
+            openVideo(targetVideoId, isReportJob);
           }
         }
       } catch {}
@@ -85,7 +106,7 @@ function App() {
     stream.onerror = () => {
       // EventSource は自動再接続を試行するため何もしない
     };
-  }, [closeStream]);
+  }, [closeStream, openVideo]);
 
   const openProject = async (id: string) => {
     closeStream();
@@ -95,23 +116,6 @@ function App() {
     setJob(undefined);
     const d = await api('/projects/' + id);
     setVideos(d.videos);
-  };
-
-  const openVideo = async (id: string) => {
-    setVideoId(id);
-    setReport(null);
-    const d = await api('/videos/' + id);
-    setEvents(d.events);
-    setReports(d.reports);
-    const latestJob = d.jobs?.[0];
-    setJob(latestJob);
-
-    // 解析中ジョブがあれば自動的に SSE を再購読して進捗を追従
-    if (latestJob && ['queued', 'running'].includes(latestJob.status)) {
-      subscribeJob(latestJob.id, id);
-    } else {
-      closeStream();
-    }
   };
 
   const newProject = async () => {
@@ -152,11 +156,10 @@ function App() {
   const createReport = async () => {
     if (!videoId) return;
     try {
-      setMessage('報告書を生成しています…');
-      const r = await api('/videos/' + videoId + '/report', { method: 'POST' });
-      setReports(x => [r, ...x]);
-      setReport(r);
-      setMessage(r.message || '報告書を生成しました。');
+      setMessage('報告書の生成を開始しました…');
+      const j = await api('/videos/' + videoId + '/report', { method: 'POST' });
+      setJob(j);
+      subscribeJob(j.id, videoId);
     } catch (e: any) {
       setMessage(e.message);
     }
@@ -209,7 +212,7 @@ function App() {
     }
   };
 
-  const isAnalyzing = job?.status === 'running' || job?.status === 'queued';
+  const isWorking = job?.status === 'running' || job?.status === 'queued';
 
   return (
     <main>
@@ -285,16 +288,16 @@ function App() {
                   <p>動画ハッシュ: <code>{current?.sha256}</code></p>
                 </div>
                 <div className="actions">
-                  <button onClick={analyze} className="primary" disabled={isAnalyzing}>✦ 解析開始</button>
-                  <button onClick={createReport} disabled={!events.length || isAnalyzing}>報告書を生成</button>
-                  <button className="delete" onClick={deleteVideo} disabled={isAnalyzing}>削除</button>
+                  <button onClick={analyze} className="primary" disabled={isWorking}>✦ 解析開始</button>
+                  <button onClick={createReport} disabled={!events.length || isWorking}>報告書を生成</button>
+                  <button className="delete" onClick={deleteVideo} disabled={isWorking}>削除</button>
                 </div>
               </div>
 
               {job && (
                 <div className={'job ' + job.status}>
                   <div>
-                    <b>{job.status === 'completed' ? '解析完了' : job.status === 'failed' ? '解析失敗' : '解析中'}</b>
+                    <b>{job.status === 'completed' ? '完了' : job.status === 'failed' ? '失敗' : '処理中'}</b>
                     <span>{job.message}</span>
                   </div>
                   <div className="progress">

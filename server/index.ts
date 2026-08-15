@@ -82,18 +82,6 @@ function cleanModelText(text: string): string {
   return cleaned;
 }
 
-// APIレスポンスからコンテンツ文字列を安全に取得（reasoning_content等にも対応）
-function extractChoiceContent(choice: any): string {
-  if (!choice) return '';
-  const msg = choice.message;
-  if (msg) {
-    if (typeof msg.content === 'string' && msg.content.trim()) return msg.content;
-    if (typeof msg.reasoning_content === 'string' && msg.reasoning_content.trim()) return msg.reasoning_content;
-  }
-  if (typeof choice.text === 'string' && choice.text.trim()) return choice.text;
-  return typeof msg?.content === 'string' ? msg.content : '';
-}
-
 // 自然言語テキストからイベントを救済抽出するフォールバック
 function extractEventsFromText(text: string): any[] {
   const events: any[] = [];
@@ -210,7 +198,7 @@ function reportFallback(video: any, events: any[], reason?: string) {
   return `# 作業報告書\n\n## 作業概要\n\n対象動画: ${video.name}\n\n## 時系列の作業内容\n\n${lines.join('\n')}\n\n## 異常・留意事項\n\n観測イベント上、明示的な異常は記録されていません。\n\n## 根拠\n\n本報告書は、保存された時系列イベントおよび各イベントに紐づく動画フレームを根拠に作成しました。\n${reason ? `\n> 注記: LM Studioによる文章整形が利用できなかったため、イベントデータから直接生成しています（${reason}）。` : ''}`;
 }
 
-// ストリーミング（SSE）受信により、長時間の思考・推論でもタイムアウト切断（Client disconnected）を100%防止するVisionモデル呼び出し関数
+// ストリーミング（SSE）受信により、長時間の思考・推論でもタイムアウト切断を100%防止するVisionモデル呼び出し関数
 async function callVisionModelStream(
   base: string,
   model: string,
@@ -229,7 +217,6 @@ async function callVisionModelStream(
     });
   }
 
-  // 試行1: stream: true (ストリーミング受信でタイムアウトを完全に防止)
   const attempts: { name: string; body: any }[] = [
     {
       name: 'stream_plain',
@@ -275,7 +262,6 @@ async function callVisionModelStream(
         throw new Error('レスポンスボディが空です');
       }
 
-      // ストリーミングデータをチャンク単位で読み込み（接続を常にアクティブに維持）
       const reader = res.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let buffer = '';
@@ -322,6 +308,104 @@ async function callVisionModelStream(
         return finalText;
       }
 
+      lastError = new Error('ストリームから有効なテキストを受信できませんでした');
+    } catch (err: any) {
+      lastError = err;
+    }
+  }
+
+  const causeDetail = lastError?.cause?.message || lastError?.cause?.code || '';
+  const detail = causeDetail ? ` (${causeDetail})` : '';
+  throw new Error(`${lastError?.message || 'LM Studioへの接続に失敗しました'}${detail}`);
+}
+
+// 報告書作成用のテキストストリーミング呼び出し関数
+async function callChatModelStream(
+  base: string,
+  model: string,
+  prompt: string,
+  headers: Record<string, string>,
+  onProgress?: (tokenCount: number) => void
+): Promise<string> {
+  const attempts: { name: string; body: any }[] = [
+    {
+      name: 'stream_plain',
+      body: {
+        model,
+        temperature: 0.2,
+        max_tokens: 4096,
+        stream: true,
+        messages: [{ role: 'user', content: prompt }]
+      }
+    }
+  ];
+
+  let lastError: any = null;
+
+  for (const attempt of attempts) {
+    try {
+      const res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers,
+        keepalive: true,
+        body: JSON.stringify(attempt.body),
+      });
+
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => '');
+        lastError = new Error(`HTTP ${res.status}: ${errorText}`);
+        continue;
+      }
+
+      if (!res.body) {
+        throw new Error('レスポンスボディが空です');
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let accumulatedContent = '';
+      let accumulatedReasoning = '';
+      let tokenCount = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith(':')) continue;
+          if (trimmed === 'data: [DONE]') continue;
+          if (trimmed.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trimmed.slice(6));
+              const delta = data.choices?.[0]?.delta;
+              if (delta) {
+                if (typeof delta.content === 'string') {
+                  accumulatedContent += delta.content;
+                  tokenCount++;
+                }
+                if (typeof delta.reasoning_content === 'string') {
+                  accumulatedReasoning += delta.reasoning_content;
+                  tokenCount++;
+                }
+                if (tokenCount % 10 === 0 && onProgress) {
+                  onProgress(tokenCount);
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+
+      const finalText = accumulatedContent.trim() || accumulatedReasoning.trim();
+      if (finalText) {
+        return finalText;
+      }
       lastError = new Error('ストリームから有効なテキストを受信できませんでした');
     } catch (err: any) {
       lastError = err;
@@ -495,6 +579,82 @@ async function analyze(jobId: string, video: any) {
   }
 }
 
+// 非同期で報告書を生成する関数（ストリーミング受信とリアルタイム進捗通知）
+async function generateReport(jobId: string, video: any) {
+  try {
+    updateJob(jobId, 10, '観測イベントを確認しています');
+    const events = db.prepare('SELECT * FROM events WHERE video_id=? ORDER BY start_time').all(video.id) as any[];
+    if (!events.length) throw new Error('先にイベントを解析してください');
+
+    const base = getSetting('lmstudio_url', 'http://127.0.0.1:1234/v1').replace(/\/$/, '');
+    const model = getSetting('lmstudio_model', '').trim();
+    if (!model) throw new Error('LM Studioのモデルを設定画面で選択してください');
+
+    const compact = events.map(e => ({ time: e.start_time, description: e.description, type: e.event_type, confidence: e.confidence }));
+    const prompt = `あなたは作業報告書の作成担当です。以下の観測イベントだけを根拠に、詳細な日本語の作業報告書をMarkdownで作成してください。推測は書かず、不確実な事実は明記してください。見出しは「# 作業報告書」「## 作業概要」「## 時系列の作業内容」「## 異常・留意事項」「## 根拠」を含めてください。
+【重要指示】思考（Reasoning）は必要最小限とし、速やかにMarkdown本文を出力してください。
+
+動画名: ${video.name}
+観測イベント一覧:
+${JSON.stringify(compact, null, 2)}`;
+
+    updateJob(jobId, 25, 'LM Studioで報告書を生成中...');
+
+    let markdown = '';
+    let fallbackReason = '';
+
+    try {
+      const rawText = await callChatModelStream(
+        base,
+        model,
+        prompt,
+        lmStudioHeaders(),
+        (tokenCount) => {
+          const p = Math.min(90, 25 + Math.floor(tokenCount / 8));
+          updateJob(jobId, p, `報告書を生成中 (${tokenCount}トークン生成)...`);
+        }
+      );
+
+      db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
+        randomUUID(),
+        video.id,
+        'report',
+        model,
+        prompt,
+        rawText,
+        now()
+      );
+
+      const cleaned = cleanModelText(rawText);
+      markdown = cleaned.replace(/^```(?:markdown)?\s*/i, '').replace(/\s*```$/, '').trim();
+      if (!markdown) throw new Error('LM Studioが有効な報告書本文を返しませんでした');
+    } catch (err: any) {
+      fallbackReason = err.message;
+      markdown = reportFallback(video, events, fallbackReason);
+    }
+
+    updateJob(jobId, 95, '報告書を保存しています');
+    const report = {
+      id: randomUUID(),
+      video_id: video.id,
+      title: `${video.name} 作業報告書${fallbackReason ? '（イベントから生成）' : ''}`,
+      markdown,
+      created_at: now(),
+    };
+    db.prepare('INSERT INTO reports VALUES (?,?,?,?,?)').run(report.id, report.video_id, report.title, report.markdown, report.created_at);
+
+    updateJob(
+      jobId,
+      100,
+      fallbackReason ? `イベントから報告書を生成しました: ${fallbackReason}` : '報告書の生成が完了しました',
+      'completed'
+    );
+  } catch (error: any) {
+    const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
+    updateJob(jobId, 0, `${error.message}${cause}。FFmpegとLM Studioの起動・モデル設定を確認してください。`, 'failed');
+  }
+}
+
 app.get('/api/health', (_req, res) => res.json({ ffmpeg: spawnSync('ffmpeg', ['-version']).status === 0, lmstudioUrl: getSetting('lmstudio_url', ''), node: process.version }));
 app.get('/api/settings', (_req, res) => res.json({ lmstudio_url: getSetting('lmstudio_url', ''), lmstudio_model: getSetting('lmstudio_model', ''), lmstudio_token_configured: Boolean(getSetting('lmstudio_token', '')) }));
 app.put('/api/settings', (req, res) => {
@@ -627,53 +787,17 @@ app.get('/api/jobs/:id/stream', (req, res) => {
   });
 });
 
-app.post('/api/videos/:id/report', async (req, res) => {
-  req.socket.setTimeout(0);
-  const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id) as any;
-  const events = db.prepare('SELECT * FROM events WHERE video_id=? ORDER BY start_time').all(req.params.id) as any[];
+// 報告書生成エンドポイント: 非同期ジョブとして開始し、ストリーミング受信でリアルタイムに進捗更新
+app.post('/api/videos/:id/report', (req, res) => {
+  const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id);
   if (!video) return res.sendStatus(404);
-  if (!events.length) return res.status(400).json({ error: '先にイベントを解析してください' });
+  const events = db.prepare('SELECT 1 FROM events WHERE video_id=? LIMIT 1').get(req.params.id);
+  if (!events) return res.status(400).json({ error: '先にイベントを解析してください' });
 
-  const base = getSetting('lmstudio_url', '').replace(/\/$/, '');
-  const model = getSetting('lmstudio_model', '').trim();
-  const compact = events.map(e => ({ time: e.start_time, description: e.description, type: e.event_type, confidence: e.confidence }));
-  const prompt = `以下の観測イベントだけを根拠に、詳細な日本語の作業報告書をMarkdownで作成してください。推測は書かず、不確実な事実は明記してください。見出しは「作業概要」「時系列の作業内容」「異常・留意事項」「根拠」。動画名: ${video.name}\nイベント: ${JSON.stringify(compact)}`;
-  let markdown = '';
-  let fallbackReason = '';
-
-  try {
-    if (!model) throw new Error('LM Studioのモデルが未選択です');
-    const response = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: lmStudioHeaders(),
-      keepalive: true,
-      body: JSON.stringify({ model, temperature: 0.2, messages: [{ role: 'user', content: prompt }] }),
-    });
-    const raw = await response.text();
-    db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(randomUUID(), video.id, 'report', model, prompt, raw, now());
-    if (!response.ok) throw new Error(`LM Studioの応答: ${response.status} ${raw}`);
-    const json = JSON.parse(raw);
-    const content = cleanModelText(extractChoiceContent(json.choices?.[0]));
-    markdown = typeof content === 'string' ? content.trim() : '';
-    if (!markdown) throw new Error('LM Studioが報告書本文を返しませんでした');
-  } catch (error: any) {
-    fallbackReason = error.message;
-    markdown = reportFallback(video, events, fallbackReason);
-  }
-
-  const report = {
-    id: randomUUID(),
-    video_id: video.id,
-    title: `${video.name} 作業報告書${fallbackReason ? '（イベントから生成）' : ''}`,
-    markdown,
-    created_at: now(),
-  };
-  db.prepare('INSERT INTO reports VALUES (?,?,?,?,?)').run(report.id, report.video_id, report.title, report.markdown, report.created_at);
-  res.status(201).json({
-    ...report,
-    fallback: Boolean(fallbackReason),
-    message: fallbackReason ? `LM Studioの文章整形を利用できなかったため、イベントから報告書を生成しました: ${fallbackReason}` : undefined,
-  });
+  const job = { id: randomUUID(), video_id: req.params.id, status: 'queued', progress: 0, message: '報告書の生成を待機中', created_at: now(), updated_at: now() };
+  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)').run(job.id, job.video_id, job.status, job.progress, job.message, job.created_at, job.updated_at);
+  void generateReport(job.id, video);
+  res.status(202).json(job);
 });
 
 app.get('/api/reports/:id', (req, res) => {
