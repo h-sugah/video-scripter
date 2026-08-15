@@ -71,11 +71,116 @@ function seconds(value: unknown) {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
-function parseModelJson(text: string) {
-  const body = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-  const match = body.match(/(?:\{[\s\S]*\}|\[[\s\S]*\])/);
-  if (!match) throw new Error('モデルの応答にJSONがありません。');
-  return JSON.parse(match[0]);
+// 思考モデル（Thinking/Reasoning model）の <think> タグや前後の余計なテキストをクリーンアップ
+function cleanModelText(text: string): string {
+  if (!text) return '';
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  if (cleaned.includes('<think>')) {
+    const end = cleaned.indexOf('</think>');
+    if (end !== -1) cleaned = cleaned.slice(end + 8).trim();
+  }
+  return cleaned;
+}
+
+// APIレスポンスからコンテンツ文字列を安全に取得（reasoning_content等にも対応）
+function extractChoiceContent(choice: any): string {
+  if (!choice) return '';
+  const msg = choice.message;
+  if (msg) {
+    if (typeof msg.content === 'string' && msg.content.trim()) return msg.content;
+    if (typeof msg.reasoning_content === 'string' && msg.reasoning_content.trim()) return msg.reasoning_content;
+  }
+  if (typeof choice.text === 'string' && choice.text.trim()) return choice.text;
+  return typeof msg?.content === 'string' ? msg.content : '';
+}
+
+// 自然言語テキストからイベントを救済抽出するフォールバック
+function extractEventsFromText(text: string): any[] {
+  const events: any[] = [];
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('```')) continue;
+    const timeMatch = trimmed.match(/(?:(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)|(?:(\d+(?:\.\d+)?)\s*秒))/);
+    if (timeMatch) {
+      let start = 0;
+      if (timeMatch[1] && timeMatch[2]) {
+        start = Number(timeMatch[1]) * 60 + Number(timeMatch[2]);
+      } else if (timeMatch[4]) {
+        start = Number(timeMatch[4]);
+      }
+      const desc = trimmed.replace(/^[\*\-\d\.\s\:\(\)\[\]〜～\-]+/, '').trim() || trimmed;
+      if (desc.length >= 2) {
+        events.push({
+          start_time: start,
+          end_time: null,
+          event_type: 'operation',
+          description: desc,
+          objects: [],
+          confidence: 0.7,
+          frame_index: 1,
+        });
+      }
+    }
+  }
+  return events;
+}
+
+// 多段階でJSONを抽出・パースする堅牢な関数
+function parseModelJson(rawText: string): any {
+  const cleaned = cleanModelText(rawText);
+
+  // 1. ```json ... ``` または ``` ... ``` コードブロックの抽出
+  const codeBlockMatches = cleaned.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi);
+  for (const m of codeBlockMatches) {
+    try {
+      const parsed = JSON.parse(m[1].trim());
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {}
+  }
+
+  // 2. { ... } または [ ... ] の最外側の探索
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const candidate = cleaned.slice(firstBrace, lastBrace + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      try {
+        // 末尾カンマや制御文字の補正
+        const repaired = candidate.replace(/,\s*([\}\]])/g, '$1').replace(/[\u0000-\u001F]+/g, ' ');
+        return JSON.parse(repaired);
+      } catch {}
+    }
+  }
+
+  const firstBracket = cleaned.indexOf('[');
+  const lastBracket = cleaned.lastIndexOf(']');
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    const candidate = cleaned.slice(firstBracket, lastBracket + 1);
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      try {
+        const repaired = candidate.replace(/,\s*([\}\]])/g, '$1').replace(/[\u0000-\u001F]+/g, ' ');
+        return JSON.parse(repaired);
+      } catch {}
+    }
+  }
+
+  // 3. 全体の直接パース
+  try {
+    return JSON.parse(cleaned);
+  } catch {}
+
+  // 4. テキストからの救済抽出
+  const textEvents = extractEventsFromText(cleaned || rawText);
+  if (textEvents.length > 0) {
+    return { events: textEvents };
+  }
+
+  throw new Error(`モデルの応答からJSON形式のイベントデータを抽出できませんでした（応答プレビュー: ${cleaned.slice(0, 120)}...）`);
 }
 
 function normalizeEvents(payload: any) {
@@ -157,7 +262,22 @@ async function analyze(jobId: string, video: any) {
 映像に人物、画面、物体、操作が映っている場合は、それらを時系列イベントとして記録してください。
 【重要】start_time と end_time は、動画全体の開始（0秒）からの絶対秒数（${batchStartTime.toFixed(1)}〜${batchEndTime.toFixed(1)}秒の範囲）で記載してください。
 【重要】frame_index には提示されたフレーム番号（${batchStartIndex}〜${batchEndIndex}）を記載してください。
-必ずJSONのみを返してください。形式: {"events":[{"start_time":秒数,"end_time":秒数またはnull,"event_type":"operation|inspection|movement|issue|other","description":"確認できる事実","objects":["対象"],"confidence":0から1,"frame_index":${batchStartIndex}から${batchEndIndex}の番号}]}。`;
+必ず以下のJSON形式のオブジェクトのみを出力してください。余計な解説文は不要です。
+\`\`\`json
+{
+  "events": [
+    {
+      "start_time": ${batchStartTime.toFixed(1)},
+      "end_time": ${batchEndTime.toFixed(1)},
+      "event_type": "operation",
+      "description": "確認できる事実",
+      "objects": ["対象物"],
+      "confidence": 1.0,
+      "frame_index": ${batchStartIndex}
+    }
+  ]
+}
+\`\`\``;
 
       const content: any[] = [{ type: 'text', text: prompt }];
       for (const file of batchFiles) {
@@ -174,36 +294,7 @@ async function analyze(jobId: string, video: any) {
         body: JSON.stringify({
           model,
           temperature: 0.1,
-          response_format: {
-            type: 'json_schema',
-            json_schema: {
-              name: 'video_events',
-              schema: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['events'],
-                properties: {
-                  events: {
-                    type: 'array',
-                    items: {
-                      type: 'object',
-                      additionalProperties: false,
-                      required: ['start_time', 'end_time', 'event_type', 'description', 'objects', 'confidence', 'frame_index'],
-                      properties: {
-                        start_time: { type: 'number' },
-                        end_time: { type: ['number', 'null'] },
-                        event_type: { type: 'string' },
-                        description: { type: 'string' },
-                        objects: { type: 'array', items: { type: 'string' } },
-                        confidence: { type: 'number' },
-                        frame_index: { type: 'integer' }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          },
+          response_format: { type: 'json_object' },
           messages: [{ role: 'user', content }]
         })
       });
@@ -212,18 +303,22 @@ async function analyze(jobId: string, video: any) {
         throw new Error(`LM Studioの応答 (区間 ${b + 1}/${totalBatches}): ${response.status} ${await response.text()}`);
       }
 
-      const modelResponse = (await response.json() as any).choices?.[0]?.message?.content ?? '';
+      const jsonRes = await response.json() as any;
+      const modelResponse = extractChoiceContent(jsonRes.choices?.[0]);
+
       db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
         randomUUID(),
         video.id,
         `perception_batch_${b + 1}_of_${totalBatches}`,
         model,
         prompt,
-        String(modelResponse),
+        String(modelResponse || JSON.stringify(jsonRes)),
         now()
       );
 
-      const batchEvents = normalizeEvents(parseModelJson(String(modelResponse)));
+      const parsed = parseModelJson(String(modelResponse));
+      const batchEvents = normalizeEvents(parsed);
+
       for (const ev of batchEvents) {
         // frame_index の正規化（ローカル番号 1..N を返した場合は全体番号に変換）
         let fIdx = Number(ev.frame_index) || batchStartIndex;
@@ -380,7 +475,6 @@ app.post('/api/videos/:id/analyze', (req, res) => {
 
 // SSE (Server-Sent Events) エンドポイント: コネクション切断を防ぐ Keep-Alive ハートビートを実装
 app.get('/api/jobs/:id/stream', (req, res) => {
-  // ソケットタイムアウトの無効化とTCP Keep-Alive
   req.socket.setTimeout(0);
   req.socket.setKeepAlive(true, 10000);
 
@@ -395,13 +489,11 @@ app.get('/api/jobs/:id/stream', (req, res) => {
   if (!subscribers.has(req.params.id)) subscribers.set(req.params.id, new Set());
   subscribers.get(req.params.id)!.add(res);
 
-  // 初期ステータスを即時送信
   const currentJob = db.prepare('SELECT * FROM jobs WHERE id=?').get(req.params.id);
   if (currentJob) {
     res.write(`data: ${JSON.stringify(currentJob)}\n\n`);
   }
 
-  // 15秒ごとのハートビート送信（プロキシやブラウザのアイドルタイムアウトを防止）
   const heartbeat = setInterval(() => {
     try {
       res.write(': keepalive\n\n');
@@ -442,7 +534,8 @@ app.post('/api/videos/:id/report', async (req, res) => {
     const raw = await response.text();
     db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(randomUUID(), video.id, 'report', model, prompt, raw, now());
     if (!response.ok) throw new Error(`LM Studioの応答: ${response.status} ${raw}`);
-    const content = JSON.parse(raw).choices?.[0]?.message?.content;
+    const json = JSON.parse(raw);
+    const content = cleanModelText(extractChoiceContent(json.choices?.[0]));
     markdown = typeof content === 'string' ? content.trim() : '';
     if (!markdown) throw new Error('LM Studioが報告書本文を返しませんでした');
   } catch (error: any) {
@@ -477,7 +570,6 @@ app.get(/.*/, (_req, res) => existsSync(dist) ? res.sendFile(join(dist, 'index.h
 const port = Number(process.env.PORT || 5173);
 const server = app.listen(port, () => console.log(`Video Scripter: http://localhost:${port}`));
 
-// サーバータイムアウトの無効化（長時間の解析・アップロードに対応）
 server.requestTimeout = 0;
 server.headersTimeout = 0;
 server.keepAliveTimeout = 120000;
