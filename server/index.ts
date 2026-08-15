@@ -358,10 +358,10 @@ async function analyze(jobId: string, video: any) {
     }
 
     // 短い動画でも変化を追えるよう最低6枚、長時間の動画は15秒に1枚程度サンプリング
-    // 解像度を min(640,iw) に最適化（Qwen-VLやMuse Glimmer等の動的パッチモデルでのトークン溢れ・VRAM OOMを防止）
+    // 証跡としての視認性・精細度を確保するため、解像度を min(1080,iw) に設定
     const count = Math.max(6, Math.ceil(duration / 15));
     const interval = Math.max(1, duration / count);
-    await command('ffmpeg', ['-y', '-i', video.path, '-vf', `fps=1/${interval},scale='min(640,iw)':-2`, '-frames:v', String(count), join(folder, 'frame-%03d.jpg')]);
+    await command('ffmpeg', ['-y', '-i', video.path, '-vf', `fps=1/${interval},scale='min(1080,iw)':-2`, '-frames:v', String(count), join(folder, 'frame-%03d.jpg')]);
 
     const files = readdirSync(folder).filter(x => x.endsWith('.jpg')).sort();
     if (!files.length) throw new Error('フレーム画像を抽出できませんでした。');
