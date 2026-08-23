@@ -2,10 +2,30 @@ import express from 'express';
 import multer from 'multer';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, renameSync, readFileSync, rmSync } from 'node:fs';
-import { join, extname } from 'node:path';
+import { existsSync, mkdirSync, renameSync, readFileSync, rmSync, readdirSync } from 'node:fs';
+import { join, extname, basename } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+
+import {
+  getProvider,
+  getAllProviders,
+  getProviderMetaList,
+  cleanModelText,
+  parseModelJson,
+  normalizeEvents,
+  type ProviderId,
+  type ProviderConfig,
+} from './providers/index.js';
+
+import {
+  getProfile,
+  getAllProfiles,
+  buildPerceptionPrompt,
+  buildDirectVideoPrompt,
+  buildReportPrompt,
+  type ProfileId,
+} from './profiles/index.js';
 
 const root = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const data = join(root, 'data');
@@ -23,18 +43,55 @@ CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, video_id TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS ai_audits (id TEXT PRIMARY KEY, video_id TEXT NOT NULL, stage TEXT NOT NULL, model TEXT NOT NULL, prompt TEXT NOT NULL, response TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
 
-const now = () => new Date().toISOString();
-const getSetting = (key: string, fallback: string) => (db.prepare('SELECT value FROM settings WHERE key=?').get(key) as any)?.value ?? fallback;
-const setSetting = (key: string, value: string) => db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
-if (!db.prepare('SELECT 1 FROM settings WHERE key=?').get('lmstudio_url')) setSetting('lmstudio_url', 'http://127.0.0.1:1234/v1');
+// 保存された動画パスの自動修復（異なる環境間での同期やフォルダ移動に対応）
+try {
+  const existingVideos = db.prepare('SELECT id, path FROM videos').all() as { id: string; path: string }[];
+  for (const v of existingVideos) {
+    if (!v.path || !existsSync(v.path)) {
+      const filename = v.path ? basename(v.path) : `${v.id}.mp4`;
+      const target = join(uploads, filename);
+      if (existsSync(target)) {
+        db.prepare('UPDATE videos SET path=? WHERE id=?').run(target, v.id);
+      } else if (existsSync(uploads)) {
+        const matching = readdirSync(uploads).find(f => f.startsWith(v.id));
+        if (matching) {
+          db.prepare('UPDATE videos SET path=? WHERE id=?').run(join(uploads, matching), v.id);
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.warn('動画パスの整合性確認中に警告が発生しました:', e);
+}
 
-const lmStudioHeaders = () => {
-  const token = getSetting('lmstudio_token', '').trim();
-  return { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) };
-};
+const now = () => new Date().toISOString();
+const getSetting = (key: string, fallback = '') => (db.prepare('SELECT value FROM settings WHERE key=?').get(key) as any)?.value ?? fallback;
+const setSetting = (key: string, value: string) => db.prepare('INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
+
+// 初期設定の投入
+if (!getSetting('active_provider')) setSetting('active_provider', 'lmstudio');
+if (!getSetting('active_profile') || getSetting('active_profile') === 'meeting') setSetting('active_profile', 'operation');
+if (!getSetting('lmstudio_url')) setSetting('lmstudio_url', 'http://127.0.0.1:1234/v1');
+if (!getSetting('openai_url')) setSetting('openai_url', 'https://api.openai.com/v1');
+if (!getSetting('openai_model')) setSetting('openai_model', '');
+if (!getSetting('anthropic_url')) setSetting('anthropic_url', 'https://api.anthropic.com/v1');
+if (!getSetting('anthropic_model')) setSetting('anthropic_model', '');
+if (!getSetting('google_url')) setSetting('google_url', 'https://generativelanguage.googleapis.com');
+if (!getSetting('google_model')) setSetting('google_model', '');
+
+function getProviderConfig(providerId: ProviderId): ProviderConfig {
+  const provider = getProvider(providerId);
+  return {
+    id: providerId,
+    name: provider.name,
+    baseUrl: getSetting(`${providerId}_url`, provider.defaultBaseUrl),
+    token: getSetting(`${providerId}_token`, ''),
+    model: getSetting(`${providerId}_model`, provider.defaultModel),
+  };
+}
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '4mb' }));
 app.use('/media', express.static(data));
 
 const upload = multer({ dest: join(data, 'incoming'), limits: { fileSize: 10 * 1024 * 1024 * 1024 } });
@@ -42,7 +99,13 @@ const subscribers = new Map<string, Set<express.Response>>();
 
 function updateJob(id: string, progress: number, message: string, status?: string) {
   const existing = db.prepare('SELECT status FROM jobs WHERE id=?').get(id) as any;
-  db.prepare('UPDATE jobs SET progress=?,message=?,status=?,updated_at=? WHERE id=?').run(progress, message, status ?? existing?.status ?? 'running', now(), id);
+  db.prepare('UPDATE jobs SET progress=?,message=?,status=?,updated_at=? WHERE id=?').run(
+    progress,
+    message,
+    status ?? existing?.status ?? 'running',
+    now(),
+    id
+  );
   const payload = JSON.stringify(db.prepare('SELECT * FROM jobs WHERE id=?').get(id));
   const subs = subscribers.get(id);
   if (subs) {
@@ -56,13 +119,79 @@ function updateJob(id: string, progress: number, message: string, status?: strin
   }
 }
 
+function resolveVideoPath(video: { id: string; path?: string; name?: string }): string {
+  // 1. 保存されたパスがそのまま存在する場合
+  if (video.path && existsSync(video.path)) {
+    return video.path;
+  }
+
+  // 2. uploadsディレクトリ内をファイル名で検索
+  if (video.path) {
+    const filename = basename(video.path);
+    const candidateInUploads = join(uploads, filename);
+    if (existsSync(candidateInUploads)) {
+      try {
+        db.prepare('UPDATE videos SET path=? WHERE id=?').run(candidateInUploads, video.id);
+      } catch {}
+      return candidateInUploads;
+    }
+  }
+
+  // 3. video.id で始まるファイルをuploadsから検索
+  if (existsSync(uploads)) {
+    try {
+      const files = readdirSync(uploads);
+      const matching = files.find(f => f.startsWith(video.id));
+      if (matching) {
+        const found = join(uploads, matching);
+        try {
+          db.prepare('UPDATE videos SET path=? WHERE id=?').run(found, video.id);
+        } catch {}
+        return found;
+      }
+    } catch {}
+  }
+
+  throw new Error(`動画ファイルが見つかりません (${video.path || video.id})。ファイルが uploads ディレクトリ内に存在するか確認してください。`);
+}
+
+function probeDuration(videoPath: string): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    if (!existsSync(videoPath)) {
+      return reject(new Error(`動画ファイルが見つかりません: ${videoPath}`));
+    }
+    const p = spawn('ffprobe', [
+      '-v',
+      'error',
+      '-show_entries',
+      'format=duration',
+      '-of',
+      'default=noprint_wrappers=1:nokey=1',
+      videoPath,
+    ]);
+    let stdout = '';
+    let stderr = '';
+    p.stdout.on('data', d => stdout += d);
+    p.stderr.on('data', d => stderr += d);
+    p.on('error', err => reject(new Error(`ffprobeの起動に失敗しました (${err.message})。FFmpeg/ffprobeがシステムにインストールされているか確認してください。`)));
+    p.on('close', code => {
+      if (code === 0) {
+        const dur = Number(stdout.trim());
+        resolve(Number.isFinite(dur) && dur > 0 ? dur : 0);
+      } else {
+        reject(new Error(`ffprobeを実行できませんでした (終了コード ${code}): ${stderr.trim() || '動画情報を取得できませんでした'}`));
+      }
+    });
+  });
+}
+
 function command(bin: string, args: string[]) {
   return new Promise<string>((resolve, reject) => {
     const p = spawn(bin, args);
     let err = '';
     p.stderr.on('data', d => err += d);
-    p.on('error', reject);
-    p.on('close', code => code === 0 ? resolve(err) : reject(new Error(err || `${bin} failed`)));
+    p.on('error', errObj => reject(new Error(`${bin}の起動に失敗しました: ${errObj.message}`)));
+    p.on('close', code => code === 0 ? resolve(err) : reject(new Error(`${bin}の実行に失敗しました (終了コード ${code}): ${err.trim() || `${bin} failed`}`)));
   });
 }
 
@@ -71,483 +200,215 @@ function seconds(value: unknown) {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
-// 思考モデル（Thinking/Reasoning model）の <think> タグや前後の余計なテキストをクリーンアップ
-function cleanModelText(text: string): string {
-  if (!text) return '';
-  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  if (cleaned.includes('<think>')) {
-    const end = cleaned.indexOf('</think>');
-    if (end !== -1) cleaned = cleaned.slice(end + 8).trim();
-  }
-  return cleaned;
-}
-
-// 自然言語テキストからイベントを救済抽出するフォールバック
-function extractEventsFromText(text: string): any[] {
-  const events: any[] = [];
-  const lines = text.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('```')) continue;
-    const timeMatch = trimmed.match(/(?:(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)|(?:(\d+(?:\.\d+)?)\s*秒))/);
-    if (timeMatch) {
-      let start = 0;
-      if (timeMatch[1] && timeMatch[2]) {
-        start = Number(timeMatch[1]) * 60 + Number(timeMatch[2]);
-      } else if (timeMatch[4]) {
-        start = Number(timeMatch[4]);
-      }
-      const desc = trimmed.replace(/^[\*\-\d\.\s\:\(\)\[\]〜～\-]+/, '').trim() || trimmed;
-      if (desc.length >= 2) {
-        events.push({
-          start_time: start,
-          end_time: null,
-          event_type: 'operation',
-          description: desc,
-          objects: [],
-          confidence: 0.7,
-          frame_index: 1,
-        });
-      }
-    }
-  }
-  return events;
-}
-
-// 多段階でJSONを抽出・パースする堅牢な関数
-function parseModelJson(rawText: string): any {
-  const cleaned = cleanModelText(rawText);
-
-  // 1. ```json ... ``` または ``` ... ``` コードブロックの抽出
-  const codeBlockMatches = cleaned.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi);
-  for (const m of codeBlockMatches) {
-    try {
-      const parsed = JSON.parse(m[1].trim());
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch {}
-  }
-
-  // 2. { ... } または [ ... ] の最外側の探索
-  const firstBrace = cleaned.indexOf('{');
-  const lastBrace = cleaned.lastIndexOf('}');
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    const candidate = cleaned.slice(firstBrace, lastBrace + 1);
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      try {
-        const repaired = candidate.replace(/,\s*([\}\]])/g, '$1').replace(/[\u0000-\u001F]+/g, ' ');
-        return JSON.parse(repaired);
-      } catch {}
-    }
-  }
-
-  const firstBracket = cleaned.indexOf('[');
-  const lastBracket = cleaned.lastIndexOf(']');
-  if (firstBracket !== -1 && lastBracket > firstBracket) {
-    const candidate = cleaned.slice(firstBracket, lastBracket + 1);
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      try {
-        const repaired = candidate.replace(/,\s*([\}\]])/g, '$1').replace(/[\u0000-\u001F]+/g, ' ');
-        return JSON.parse(repaired);
-      } catch {}
-    }
-  }
-
-  // 3. 全体の直接パース
-  try {
-    return JSON.parse(cleaned);
-  } catch {}
-
-  // 4. テキストからの救済抽出
-  const textEvents = extractEventsFromText(cleaned || rawText);
-  if (textEvents.length > 0) {
-    return { events: textEvents };
-  }
-
-  throw new Error(`モデルの応答からJSON形式のイベントデータを抽出できませんでした（応答プレビュー: ${cleaned.slice(0, 120)}...）`);
-}
-
-function normalizeEvents(payload: any) {
-  const candidates = [payload?.events, payload?.timeline, payload?.items, payload?.results, Array.isArray(payload) ? payload : null];
-  const raw = candidates.find(Array.isArray) ?? [];
-  return raw.filter((event: any) => event && typeof event === 'object' && (event.description || event.content || event.action || event.summary)).map((event: any) => ({
-    start_time: event.start_time ?? event.timestamp ?? event.time ?? event.start ?? 0,
-    end_time: event.end_time ?? event.end ?? null,
-    event_type: event.event_type ?? event.type ?? 'other',
-    description: event.description ?? event.content ?? event.action ?? event.summary,
-    objects: event.objects ?? event.subjects ?? [],
-    confidence: event.confidence ?? 0.5,
-    frame_index: event.frame_index ?? event.frame ?? 1,
-  }));
-}
-
 function formatDuration(sec: number) {
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-function reportFallback(video: any, events: any[], reason?: string) {
+function reportFallback(video: any, events: any[], profileId: ProfileId, reason?: string) {
+  const profile = getProfile(profileId);
   const lines = events.map((event) => {
     const objects = JSON.parse(event.objects_json || '[]');
-    return `- ${String(Math.floor(event.start_time / 60)).padStart(2, '0')}:${String(Math.floor(event.start_time % 60)).padStart(2, '0')}　${event.description}${objects.length ? `（対象: ${objects.join('、')}）` : ''}`;
+    return `- ${formatDuration(event.start_time)}　${event.description}${objects.length ? `（対象: ${objects.join('、')}）` : ''}`;
   });
-  return `# 作業報告書\n\n## 作業概要\n\n対象動画: ${video.name}\n\n## 時系列の作業内容\n\n${lines.join('\n')}\n\n## 異常・留意事項\n\n観測イベント上、明示的な異常は記録されていません。\n\n## 根拠\n\n本報告書は、保存された時系列イベントおよび各イベントに紐づく動画フレームを根拠に作成しました。\n${reason ? `\n> 注記: LM Studioによる文章整形が利用できなかったため、イベントデータから直接生成しています（${reason}）。` : ''}`;
+
+  return `# ${video.name} ${profile.name}
+
+## 概要
+- **対象動画**: ${video.name}
+- **解析プロファイル**: ${profile.name}
+- **イベント件数**: ${events.length} 件
+
+## 時系列記録
+${lines.join('\n')}
+
+## 留意事項
+観測イベント上、明示的な異常や特記事項は記録されていません。
+
+## 根拠
+本記録は、保存された時系列イベントおよび各イベントに紐づく動画フレームを根拠に作成しました。
+${reason ? `\n> 注記: AIモデルによる文章整形が利用できなかったため、イベントデータから直接生成しています（${reason}）。` : ''}`;
 }
 
-// ストリーミング（SSE）受信により、長時間の思考・推論でもタイムアウト切断を100%防止するVisionモデル呼び出し関数
-async function callVisionModelStream(
-  base: string,
-  model: string,
-  prompt: string,
-  batchFiles: string[],
-  folder: string,
-  headers: Record<string, string>,
-  onProgress?: (tokenCount: number) => void
-): Promise<string> {
-  const content: any[] = [{ type: 'text', text: prompt }];
-  for (const file of batchFiles) {
-    const b64 = readFileSync(join(folder, file)).toString('base64');
-    content.push({
-      type: 'image_url',
-      image_url: { url: `data:image/jpeg;base64,${b64}` }
-    });
-  }
-
-  const attempts: { name: string; body: any }[] = [
-    {
-      name: 'stream_plain',
-      body: {
-        model,
-        temperature: 0.1,
-        max_tokens: 4096,
-        stream: true,
-        messages: [{ role: 'user', content }]
-      }
-    },
-    {
-      name: 'stream_json',
-      body: {
-        model,
-        temperature: 0.1,
-        max_tokens: 4096,
-        stream: true,
-        response_format: { type: 'json_object' },
-        messages: [{ role: 'user', content }]
-      }
-    }
-  ];
-
-  let lastError: any = null;
-
-  for (const attempt of attempts) {
-    try {
-      const res = await fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers,
-        keepalive: true,
-        body: JSON.stringify(attempt.body),
-      });
-
-      if (!res.ok) {
-        const errorText = await res.text().catch(() => '');
-        lastError = new Error(`HTTP ${res.status}: ${errorText}`);
-        continue;
-      }
-
-      if (!res.body) {
-        throw new Error('レスポンスボディが空です');
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      let buffer = '';
-      let accumulatedContent = '';
-      let accumulatedReasoning = '';
-      let tokenCount = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':')) continue;
-          if (trimmed === 'data: [DONE]') continue;
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(trimmed.slice(6));
-              const delta = data.choices?.[0]?.delta;
-              if (delta) {
-                if (typeof delta.content === 'string') {
-                  accumulatedContent += delta.content;
-                  tokenCount++;
-                }
-                if (typeof delta.reasoning_content === 'string') {
-                  accumulatedReasoning += delta.reasoning_content;
-                  tokenCount++;
-                }
-                if (tokenCount % 15 === 0 && onProgress) {
-                  onProgress(tokenCount);
-                }
-              }
-            } catch {}
-          }
-        }
-      }
-
-      const finalText = accumulatedContent.trim() || accumulatedReasoning.trim();
-      if (finalText) {
-        return finalText;
-      }
-
-      lastError = new Error('ストリームから有効なテキストを受信できませんでした');
-    } catch (err: any) {
-      lastError = err;
-    }
-  }
-
-  const causeDetail = lastError?.cause?.message || lastError?.cause?.code || '';
-  const detail = causeDetail ? ` (${causeDetail})` : '';
-  throw new Error(`${lastError?.message || 'LM Studioへの接続に失敗しました'}${detail}`);
-}
-
-// 報告書作成用のテキストストリーミング呼び出し関数
-async function callChatModelStream(
-  base: string,
-  model: string,
-  prompt: string,
-  headers: Record<string, string>,
-  onProgress?: (tokenCount: number) => void
-): Promise<string> {
-  const attempts: { name: string; body: any }[] = [
-    {
-      name: 'stream_plain',
-      body: {
-        model,
-        temperature: 0.2,
-        max_tokens: 4096,
-        stream: true,
-        messages: [{ role: 'user', content: prompt }]
-      }
-    }
-  ];
-
-  let lastError: any = null;
-
-  for (const attempt of attempts) {
-    try {
-      const res = await fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers,
-        keepalive: true,
-        body: JSON.stringify(attempt.body),
-      });
-
-      if (!res.ok) {
-        const errorText = await res.text().catch(() => '');
-        lastError = new Error(`HTTP ${res.status}: ${errorText}`);
-        continue;
-      }
-
-      if (!res.body) {
-        throw new Error('レスポンスボディが空です');
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      let buffer = '';
-      let accumulatedContent = '';
-      let accumulatedReasoning = '';
-      let tokenCount = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':')) continue;
-          if (trimmed === 'data: [DONE]') continue;
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(trimmed.slice(6));
-              const delta = data.choices?.[0]?.delta;
-              if (delta) {
-                if (typeof delta.content === 'string') {
-                  accumulatedContent += delta.content;
-                  tokenCount++;
-                }
-                if (typeof delta.reasoning_content === 'string') {
-                  accumulatedReasoning += delta.reasoning_content;
-                  tokenCount++;
-                }
-                if (tokenCount % 10 === 0 && onProgress) {
-                  onProgress(tokenCount);
-                }
-              }
-            } catch {}
-          }
-        }
-      }
-
-      const finalText = accumulatedContent.trim() || accumulatedReasoning.trim();
-      if (finalText) {
-        return finalText;
-      }
-      lastError = new Error('ストリームから有効なテキストを受信できませんでした');
-    } catch (err: any) {
-      lastError = err;
-    }
-  }
-
-  const causeDetail = lastError?.cause?.message || lastError?.cause?.code || '';
-  const detail = causeDetail ? ` (${causeDetail})` : '';
-  throw new Error(`${lastError?.message || 'LM Studioへの接続に失敗しました'}${detail}`);
-}
-
-async function analyze(jobId: string, video: any) {
+// 動画解析処理オーケストレーター
+async function analyze(
+  jobId: string,
+  video: any,
+  options?: { providerId?: ProviderId; profileId?: ProfileId; customPerceptionPrompt?: string; mode?: 'auto' | 'direct' | 'frames' }
+) {
   try {
+    const resolvedPath = resolveVideoPath(video);
     updateJob(jobId, 5, '動画情報を確認しています');
-    const probe = await new Promise<string>((resolve, reject) => {
-      const p = spawn('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video.path]);
-      let out = '';
-      p.stdout.on('data', d => out += d);
-      p.on('error', reject);
-      p.on('close', c => c === 0 ? resolve(out) : reject(new Error('ffprobeを実行できません')));
-    });
-    const duration = Number(probe.trim());
+    const duration = await probeDuration(resolvedPath);
     db.prepare('UPDATE videos SET duration=? WHERE id=?').run(duration, video.id);
 
-    updateJob(jobId, 15, '代表フレームを抽出しています');
+    const providerId = (options?.providerId || getSetting('active_provider', 'lmstudio')) as ProviderId;
+    const profileId = (options?.profileId || getSetting('active_profile', 'operation')) as ProfileId;
+    const customPrompt = options?.customPerceptionPrompt ?? getSetting('custom_perception_prompt', '');
+    const mode = options?.mode || (getSetting('video_analysis_mode', 'auto') as 'auto' | 'direct' | 'frames');
+
+    const provider = getProvider(providerId);
+    const providerConfig = getProviderConfig(providerId);
+    const profile = getProfile(profileId);
+
+    updateJob(jobId, 10, '代表フレームを抽出しています');
     const folder = join(framesRoot, video.id);
     mkdirSync(folder, { recursive: true });
 
-    // 既存の古いフレームをクリーンアップ
-    const { readdirSync, rmSync: removeFile } = await import('node:fs');
+    // 既存フレームのクリーンアップ
     const existing = readdirSync(folder);
     for (const f of existing) {
-      try { removeFile(join(folder, f)); } catch {}
+      try { rmSync(join(folder, f)); } catch {}
     }
 
-    // 短い動画でも変化を追えるよう最低6枚、長時間の動画は15秒に1枚程度サンプリング
-    // 証跡としての視認性・精細度を確保するため、解像度を min(1080,iw) に設定
+    // 証跡・フォールバック用フレーム抽出
     const count = Math.max(6, Math.ceil(duration / 15));
     const interval = Math.max(1, duration / count);
-    await command('ffmpeg', ['-y', '-i', video.path, '-vf', `fps=1/${interval},scale='min(1080,iw)':-2`, '-frames:v', String(count), join(folder, 'frame-%03d.jpg')]);
+    await command('ffmpeg', [
+      '-y',
+      '-i',
+      resolvedPath,
+      '-vf',
+      `fps=1/${interval},scale='min(1080,iw)':-2`,
+      '-frames:v',
+      String(count),
+      join(folder, 'frame-%03d.jpg'),
+    ]);
 
     const files = readdirSync(folder).filter(x => x.endsWith('.jpg')).sort();
     if (!files.length) throw new Error('フレーム画像を抽出できませんでした。');
 
-    const base = getSetting('lmstudio_url', 'http://127.0.0.1:1234/v1').replace(/\/$/, '');
-    const model = getSetting('lmstudio_model', '').trim();
-    if (!model) throw new Error('LM StudioのVision対応モデルを設定画面で選択してください');
-
-    // 1バッチあたり4フレーム（約1,200〜1,500トークン）でコンテキスト長2048〜4096のモデルでも安全に動作
-    const BATCH_SIZE = 4;
-    const totalBatches = Math.ceil(files.length / BATCH_SIZE);
     const allEvents: any[] = [];
 
-    for (let b = 0; b < totalBatches; b++) {
-      const batchFiles = files.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
-      const batchStartIndex = b * BATCH_SIZE + 1; // 1-indexed
-      const batchEndIndex = batchStartIndex + batchFiles.length - 1;
+    // Geminiなど、Capabilityとしてvideo_input = true を持ち、モードが direct / auto の場合
+    if (provider.capabilities.video_input && mode !== 'frames' && provider.analyzeVideoDirect) {
+      updateJob(jobId, 20, `${provider.name} に動画を送信して直接解析を開始します...`);
 
-      const batchStartTime = (batchStartIndex - 1) * interval;
-      const batchEndTime = Math.min(duration, batchEndIndex * interval);
+      const prompt = buildDirectVideoPrompt({
+        profileId,
+        videoName: video.name,
+        duration,
+        customPrompt,
+      });
 
-      const progress = Math.round(20 + (b / totalBatches) * 75);
-      const rangeStr = `${formatDuration(batchStartTime)}〜${formatDuration(batchEndTime)}`;
-      updateJob(jobId, progress, `区間 ${b + 1}/${totalBatches} (${rangeStr}) の${batchFiles.length}フレームをLM Studioで解析中...`);
-
-      const prompt = `あなたは作業映像の監査担当です。以下の動画区間から抽出された【${batchFiles.length}枚のフレーム画像】（動画全体${duration.toFixed(1)}秒中の ${batchStartTime.toFixed(1)}秒〜${batchEndTime.toFixed(1)}秒付近、各フレームは約${interval.toFixed(1)}秒間隔、フレーム番号 #${batchStartIndex}〜#${batchEndIndex}）を時系列順に観察し、確認できる事実だけを日本語で詳細に抽出してください。
-
-【重要指示】
-1. 思考（Thinking/Reasoning）は必要最小限（3行以内）とし、速やかに指定のJSON形式で出力してください。
-2. 添付された画像は全部で${batchFiles.length}枚です。それぞれのフレーム番号は #${batchStartIndex} から #${batchEndIndex} です。
-3. start_time と end_time は、動画全体の開始（0秒）からの絶対秒数（${batchStartTime.toFixed(1)}〜${batchEndTime.toFixed(1)}秒の範囲）で記載してください。
-4. frame_index には提示されたフレーム番号（${batchStartIndex}〜${batchEndIndex}）を記載してください。
-5. 必ず以下のJSON形式のオブジェクトのみを出力してください。
-
-\`\`\`json
-{
-  "events": [
-    {
-      "start_time": ${batchStartTime.toFixed(1)},
-      "end_time": ${batchEndTime.toFixed(1)},
-      "event_type": "operation",
-      "description": "確認できる事実",
-      "objects": ["対象物"],
-      "confidence": 1.0,
-      "frame_index": ${batchStartIndex}
-    }
-  ]
-}
-\`\`\``;
-
-      const modelResponse = await callVisionModelStream(
-        base,
-        model,
+      const modelResponse = await provider.analyzeVideoDirect({
+        config: providerConfig,
         prompt,
-        batchFiles,
-        folder,
-        lmStudioHeaders(),
-        (tokenCount) => {
-          updateJob(jobId, progress, `区間 ${b + 1}/${totalBatches} (${rangeStr}) 解析中 (${tokenCount}トークン生成)...`);
-        }
-      );
+        videoPath: resolvedPath,
+        videoName: video.name,
+        mimeType: 'video/mp4',
+        duration,
+        onProgress: (msg) => {
+          updateJob(jobId, 45, msg);
+        },
+      });
 
       db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
         randomUUID(),
         video.id,
-        `perception_batch_${b + 1}_of_${totalBatches}`,
-        model,
+        `direct_video_${profileId}`,
+        providerConfig.model || provider.defaultModel,
         prompt,
         String(modelResponse),
         now()
       );
 
       const parsed = parseModelJson(String(modelResponse));
-      const batchEvents = normalizeEvents(parsed);
+      const directEvents = normalizeEvents(parsed);
 
-      for (const ev of batchEvents) {
-        let fIdx = Number(ev.frame_index) || batchStartIndex;
-        if (fIdx >= 1 && fIdx <= batchFiles.length && fIdx < batchStartIndex) {
-          fIdx = batchStartIndex + fIdx - 1;
-        }
-        fIdx = Math.max(1, Math.min(files.length, fIdx));
-
-        let st = seconds(ev.start_time);
-        if (st < batchStartTime && (st + batchStartTime) <= (batchEndTime + interval * 2)) {
-          st = st + batchStartTime;
-        }
-        let et = ev.end_time == null ? null : seconds(ev.end_time);
-        if (et != null && et < batchStartTime && (et + batchStartTime) <= (batchEndTime + interval * 2)) {
-          et = et + batchStartTime;
-        }
-
+      for (const ev of directEvents) {
+        const st = seconds(ev.start_time);
+        const et = ev.end_time == null ? null : seconds(ev.end_time);
+        // フレーム番号を計算 (1-indexed)
+        const frameIdx = Math.max(1, Math.min(files.length, Math.round(st / interval) + 1));
         allEvents.push({
           ...ev,
-          frame_index: fIdx,
+          frame_index: frameIdx,
           start_time: st,
           end_time: et,
         });
       }
+    } else {
+      // フレーム画像バッチ方式 (LM Studio, OpenAI, Claude, またはフレーム指定時)
+      const BATCH_SIZE = 4;
+      const totalBatches = Math.ceil(files.length / BATCH_SIZE);
+
+      for (let b = 0; b < totalBatches; b++) {
+        const batchFiles = files.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+        const batchStartIndex = b * BATCH_SIZE + 1; // 1-indexed
+        const batchEndIndex = batchStartIndex + batchFiles.length - 1;
+
+        const batchStartTime = (batchStartIndex - 1) * interval;
+        const batchEndTime = Math.min(duration, batchEndIndex * interval);
+
+        const progress = Math.round(20 + (b / totalBatches) * 75);
+        const rangeStr = `${formatDuration(batchStartTime)}〜${formatDuration(batchEndTime)}`;
+        updateJob(jobId, progress, `[${profile.name}] 区間 ${b + 1}/${totalBatches} (${rangeStr}) の${batchFiles.length}フレームを ${provider.name} で解析中...`);
+
+        const prompt = buildPerceptionPrompt({
+          profileId,
+          duration,
+          batchCount: batchFiles.length,
+          batchStartIndex,
+          batchEndIndex,
+          batchStartTime,
+          batchEndTime,
+          interval,
+          customPrompt,
+        });
+
+        const modelResponse = await provider.analyzeVisionBatch({
+          config: providerConfig,
+          prompt,
+          batchFiles,
+          folder,
+          onProgress: (tokenCount) => {
+            updateJob(jobId, progress, `[${profile.name}] 区間 ${b + 1}/${totalBatches} (${rangeStr}) 解析中 (${tokenCount}トークン)...`);
+          },
+        });
+
+        db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
+          randomUUID(),
+          video.id,
+          `batch_${b + 1}_of_${totalBatches}_${profileId}`,
+          providerConfig.model || provider.defaultModel,
+          prompt,
+          String(modelResponse),
+          now()
+        );
+
+        const parsed = parseModelJson(String(modelResponse));
+        const batchEvents = normalizeEvents(parsed);
+
+        for (const ev of batchEvents) {
+          let fIdx = Number(ev.frame_index) || batchStartIndex;
+          if (fIdx >= 1 && fIdx <= batchFiles.length && fIdx < batchStartIndex) {
+            fIdx = batchStartIndex + fIdx - 1;
+          }
+          fIdx = Math.max(1, Math.min(files.length, fIdx));
+
+          let st = seconds(ev.start_time);
+          if (st < batchStartTime && (st + batchStartTime) <= (batchEndTime + interval * 2)) {
+            st = st + batchStartTime;
+          }
+          let et = ev.end_time == null ? null : seconds(ev.end_time);
+          if (et != null && et < batchStartTime && (et + batchStartTime) <= (batchEndTime + interval * 2)) {
+            et = et + batchStartTime;
+          }
+
+          allEvents.push({
+            ...ev,
+            frame_index: fIdx,
+            start_time: st,
+            end_time: et,
+          });
+        }
+      }
     }
 
     if (!allEvents.length) {
-      throw new Error('モデルがイベントを返しませんでした。Vision対応モデルがLM Studioでロード・選択されていることを確認してください（AI応答は監査ログに保存済みです）');
+      throw new Error(`モデルがイベントを返しませんでした。${provider.name} の設定とモデルの画像/動画認識対応を確認してください。`);
     }
 
     updateJob(jobId, 95, '時系列イベントを保存しています');
@@ -566,60 +427,80 @@ async function analyze(jobId: string, video: any) {
         String(event.event_type || 'other'),
         String(event.description || '内容不明'),
         JSON.stringify(Array.isArray(event.objects) ? event.objects : []),
-        Math.max(0, Math.min(1, Number(event.confidence) || 0)),
-        JSON.stringify({ frame: `frames/${video.id}/${files[idx - 1]}`, frame_index: idx, approximate_time: (idx - 0.5) * interval }),
+        Math.max(0, Math.min(1, Number(event.confidence) || 0.8)),
+        JSON.stringify({
+          frame: `frames/${video.id}/${files[idx - 1]}`,
+          frame_index: idx,
+          approximate_time: (idx - 0.5) * interval,
+          provider: provider.name,
+          profile: profile.name,
+        }),
         now()
       );
     }
 
-    updateJob(jobId, 100, `${allEvents.length}件のイベントを抽出しました`, 'completed');
+    updateJob(jobId, 100, `【${profile.name}】${allEvents.length}件のイベントを抽出しました（${provider.name}）`, 'completed');
   } catch (error: any) {
     const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
-    updateJob(jobId, 0, `${error.message}${cause}。FFmpegとLM Studioの起動・モデル設定を確認してください。`, 'failed');
+    updateJob(jobId, 0, `${error.message}${cause}`, 'failed');
   }
 }
 
-// 非同期で報告書を生成する関数（ストリーミング受信とリアルタイム進捗通知）
-async function generateReport(jobId: string, video: any) {
+// 報告書生成処理オーケストレーター
+async function generateReport(
+  jobId: string,
+  video: any,
+  options?: { providerId?: ProviderId; profileId?: ProfileId; customReportPrompt?: string }
+) {
   try {
     updateJob(jobId, 10, '観測イベントを確認しています');
     const events = db.prepare('SELECT * FROM events WHERE video_id=? ORDER BY start_time').all(video.id) as any[];
     if (!events.length) throw new Error('先にイベントを解析してください');
 
-    const base = getSetting('lmstudio_url', 'http://127.0.0.1:1234/v1').replace(/\/$/, '');
-    const model = getSetting('lmstudio_model', '').trim();
-    if (!model) throw new Error('LM Studioのモデルを設定画面で選択してください');
+    const providerId = (options?.providerId || getSetting('active_provider', 'lmstudio')) as ProviderId;
+    const profileId = (options?.profileId || getSetting('active_profile', 'operation')) as ProfileId;
+    const customPrompt = options?.customReportPrompt ?? getSetting('custom_report_prompt', '');
 
-    const compact = events.map(e => ({ time: e.start_time, description: e.description, type: e.event_type, confidence: e.confidence }));
-    const prompt = `あなたは作業報告書の作成担当です。以下の観測イベントだけを根拠に、詳細な日本語の作業報告書をMarkdownで作成してください。推測は書かず、不確実な事実は明記してください。見出しは「# 作業報告書」「## 作業概要」「## 時系列の作業内容」「## 異常・留意事項」「## 根拠」を含めてください。
-【重要指示】思考（Reasoning）は必要最小限とし、速やかにMarkdown本文を出力してください。
+    const provider = getProvider(providerId);
+    const providerConfig = getProviderConfig(providerId);
+    const profile = getProfile(profileId);
 
-動画名: ${video.name}
-観測イベント一覧:
-${JSON.stringify(compact, null, 2)}`;
+    const compact = events.map(e => ({
+      time: e.start_time,
+      description: e.description,
+      type: e.event_type,
+      confidence: e.confidence,
+      objects: JSON.parse(e.objects_json || '[]'),
+    }));
 
-    updateJob(jobId, 25, 'LM Studioで報告書を生成中...');
+    const prompt = buildReportPrompt({
+      profileId,
+      videoName: video.name,
+      duration: video.duration || 0,
+      events: compact,
+      customPrompt,
+    });
+
+    updateJob(jobId, 25, `${provider.name} で【${profile.name}】の報告書を生成中...`);
 
     let markdown = '';
     let fallbackReason = '';
 
     try {
-      const rawText = await callChatModelStream(
-        base,
-        model,
+      const rawText = await provider.generateText({
+        config: providerConfig,
         prompt,
-        lmStudioHeaders(),
-        (tokenCount) => {
+        onProgress: (tokenCount) => {
           const p = Math.min(90, 25 + Math.floor(tokenCount / 8));
-          updateJob(jobId, p, `報告書を生成中 (${tokenCount}トークン生成)...`);
-        }
-      );
+          updateJob(jobId, p, `報告書を生成中 (${provider.name}: ${tokenCount}トークン)...`);
+        },
+      });
 
       db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
         randomUUID(),
         video.id,
-        'report',
-        model,
+        `report_${profileId}`,
+        providerConfig.model || provider.defaultModel,
         prompt,
         rawText,
         now()
@@ -627,17 +508,17 @@ ${JSON.stringify(compact, null, 2)}`;
 
       const cleaned = cleanModelText(rawText);
       markdown = cleaned.replace(/^```(?:markdown)?\s*/i, '').replace(/\s*```$/, '').trim();
-      if (!markdown) throw new Error('LM Studioが有効な報告書本文を返しませんでした');
+      if (!markdown) throw new Error(`${provider.name} が有効な報告書本文を返しませんでした`);
     } catch (err: any) {
       fallbackReason = err.message;
-      markdown = reportFallback(video, events, fallbackReason);
+      markdown = reportFallback(video, events, profileId, fallbackReason);
     }
 
     updateJob(jobId, 95, '報告書を保存しています');
     const report = {
       id: randomUUID(),
       video_id: video.id,
-      title: `${video.name} 作業報告書${fallbackReason ? '（イベントから生成）' : ''}`,
+      title: `${video.name} ${profile.name}${fallbackReason ? '（イベントから自動整形）' : ''}`,
       markdown,
       created_at: now(),
     };
@@ -646,32 +527,137 @@ ${JSON.stringify(compact, null, 2)}`;
     updateJob(
       jobId,
       100,
-      fallbackReason ? `イベントから報告書を生成しました: ${fallbackReason}` : '報告書の生成が完了しました',
+      fallbackReason ? `イベントから報告書を生成しました: ${fallbackReason}` : `【${profile.name}】報告書の生成が完了しました（${provider.name}）`,
       'completed'
     );
   } catch (error: any) {
     const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
-    updateJob(jobId, 0, `${error.message}${cause}。FFmpegとLM Studioの起動・モデル設定を確認してください。`, 'failed');
+    updateJob(jobId, 0, `${error.message}${cause}`, 'failed');
   }
 }
 
-app.get('/api/health', (_req, res) => res.json({ ffmpeg: spawnSync('ffmpeg', ['-version']).status === 0, lmstudioUrl: getSetting('lmstudio_url', ''), node: process.version }));
-app.get('/api/settings', (_req, res) => res.json({ lmstudio_url: getSetting('lmstudio_url', ''), lmstudio_model: getSetting('lmstudio_model', ''), lmstudio_token_configured: Boolean(getSetting('lmstudio_token', '')) }));
+// API Routes
+app.get('/api/health', (_req, res) => {
+  const activeProvider = getSetting('active_provider', 'lmstudio') as ProviderId;
+  let ffmpegOk = false;
+  let ffprobeOk = false;
+  try {
+    ffmpegOk = spawnSync('ffmpeg', ['-version']).status === 0;
+  } catch {}
+  try {
+    ffprobeOk = spawnSync('ffprobe', ['-version']).status === 0;
+  } catch {}
+
+  res.json({
+    ffmpeg: ffmpegOk,
+    ffprobe: ffprobeOk,
+    activeProvider,
+    activeProfile: getSetting('active_profile', 'operation'),
+    node: process.version,
+  });
+});
+
+app.get('/api/settings', (_req, res) => {
+  const activeProvider = getSetting('active_provider', 'lmstudio') as ProviderId;
+  const activeProfile = getSetting('active_profile', 'operation') as ProfileId;
+
+  const providerSettings: Record<string, any> = {};
+  for (const p of getAllProviders()) {
+    providerSettings[p.id] = {
+      url: getSetting(`${p.id}_url`, p.defaultBaseUrl),
+      model: getSetting(`${p.id}_model`, p.defaultModel),
+      configured: Boolean(getSetting(`${p.id}_token`, '')),
+    };
+  }
+
+  res.json({
+    active_provider: activeProvider,
+    active_profile: activeProfile,
+    custom_perception_prompt: getSetting('custom_perception_prompt', ''),
+    custom_report_prompt: getSetting('custom_report_prompt', ''),
+    video_analysis_mode: getSetting('video_analysis_mode', 'auto'),
+    providers_meta: getProviderMetaList(),
+    profiles: getAllProfiles(),
+    provider_settings: providerSettings,
+    // 既存互換用
+    lmstudio_url: getSetting('lmstudio_url', 'http://127.0.0.1:1234/v1'),
+    lmstudio_model: getSetting('lmstudio_model', ''),
+    lmstudio_token_configured: Boolean(getSetting('lmstudio_token', '')),
+  });
+});
+
 app.put('/api/settings', (req, res) => {
-  for (const key of ['lmstudio_url', 'lmstudio_model']) if (typeof req.body[key] === 'string') setSetting(key, req.body[key]);
-  if (typeof req.body.lmstudio_token === 'string' && req.body.lmstudio_token.trim()) setSetting('lmstudio_token', req.body.lmstudio_token.trim());
-  if (req.body.clear_lmstudio_token === true) setSetting('lmstudio_token', '');
+  const b = req.body;
+
+  if (typeof b.active_provider === 'string') setSetting('active_provider', b.active_provider);
+  if (typeof b.active_profile === 'string') setSetting('active_profile', b.active_profile);
+  if (typeof b.custom_perception_prompt === 'string') setSetting('custom_perception_prompt', b.custom_perception_prompt);
+  if (typeof b.custom_report_prompt === 'string') setSetting('custom_report_prompt', b.custom_report_prompt);
+  if (typeof b.video_analysis_mode === 'string') setSetting('video_analysis_mode', b.video_analysis_mode);
+
+  for (const p of getAllProviders()) {
+    const pid = p.id;
+    if (typeof b[`${pid}_url`] === 'string') setSetting(`${pid}_url`, b[`${pid}_url`]);
+    if (typeof b[`${pid}_model`] === 'string') setSetting(`${pid}_model`, b[`${pid}_model`]);
+    if (typeof b[`${pid}_token`] === 'string' && b[`${pid}_token`].trim()) {
+      setSetting(`${pid}_token`, b[`${pid}_token`].trim());
+    }
+    if (b[`clear_${pid}_token`] === true) {
+      setSetting(`${pid}_token`, '');
+    }
+  }
+
+  // ネストされた provider_settings からの保存もサポート
+  if (b.provider_settings && typeof b.provider_settings === 'object') {
+    for (const [pid, ps] of Object.entries(b.provider_settings) as [string, any][]) {
+      if (typeof ps.url === 'string') setSetting(`${pid}_url`, ps.url);
+      if (typeof ps.model === 'string') setSetting(`${pid}_model`, ps.model);
+      if (typeof ps.token === 'string' && ps.token.trim()) setSetting(`${pid}_token`, ps.token.trim());
+      if (ps.clear_token === true) setSetting(`${pid}_token`, '');
+    }
+  }
+
   res.sendStatus(204);
 });
 
-app.post('/api/lmstudio/test', async (_req, res) => {
+// プロバイダー接続テスト
+app.post('/api/providers/:id/test', async (req, res) => {
+  const pid = req.params.id as ProviderId;
   try {
-    const base = getSetting('lmstudio_url', '').replace(/\/$/, '');
-    const response = await fetch(`${base}/models`, { headers: lmStudioHeaders(), keepalive: true });
-    if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
-    const body = await response.json() as any;
-    const models = [...new Set((body.data ?? []).map((item: any) => String(item.id)).filter(Boolean))];
-    res.json({ models });
+    const provider = getProvider(pid);
+    const config: ProviderConfig = {
+      id: pid,
+      name: provider.name,
+      baseUrl: (typeof req.body.url === 'string' && req.body.url.trim()) ? req.body.url.trim() : getSetting(`${pid}_url`, provider.defaultBaseUrl),
+      token: (typeof req.body.token === 'string' && req.body.token.trim()) ? req.body.token.trim() : getSetting(`${pid}_token`, ''),
+      model: (typeof req.body.model === 'string' && req.body.model.trim()) ? req.body.model.trim() : getSetting(`${pid}_model`, provider.defaultModel),
+    };
+
+    const result = await provider.testConnection(config);
+    res.json({
+      success: true,
+      provider: pid,
+      models: result.models,
+    });
+  } catch (error: any) {
+    const cause = error?.cause ? ` (${error.cause.message || error.cause.code || ''})` : '';
+    res.status(502).json({ error: `${error.message}${cause}` });
+  }
+});
+
+// 既存互換のLM Studioテスト
+app.post('/api/lmstudio/test', async (req, res) => {
+  try {
+    const provider = getProvider('lmstudio');
+    const config: ProviderConfig = {
+      id: 'lmstudio',
+      name: 'LM Studio',
+      baseUrl: getSetting('lmstudio_url', provider.defaultBaseUrl),
+      token: getSetting('lmstudio_token', ''),
+      model: getSetting('lmstudio_model', ''),
+    };
+    const result = await provider.testConnection(config);
+    res.json({ models: result.models });
   } catch (error: any) {
     const cause = error?.cause ? ` (${error.cause.message || error.cause.code || ''})` : '';
     res.status(502).json({ error: `LM Studioへ接続できません: ${error.message}${cause}` });
@@ -724,7 +710,10 @@ app.delete('/api/videos/:id', (req, res) => {
   const video = db.prepare('SELECT * FROM videos WHERE id=?').get(id) as any;
   if (!video) return res.sendStatus(404);
   try {
-    if (video.path.startsWith(uploads) && existsSync(video.path)) rmSync(video.path);
+    try {
+      const resolvedPath = resolveVideoPath(video);
+      if (existsSync(resolvedPath)) rmSync(resolvedPath);
+    } catch {}
     const frameDir = join(framesRoot, id);
     if (existsSync(frameDir)) rmSync(frameDir, { recursive: true, force: true });
     db.exec('BEGIN');
@@ -745,13 +734,21 @@ app.delete('/api/videos/:id', (req, res) => {
 app.post('/api/videos/:id/analyze', (req, res) => {
   const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id);
   if (!video) return res.sendStatus(404);
-  const job = { id: randomUUID(), video_id: req.params.id, status: 'queued', progress: 0, message: '解析を待機中', created_at: now(), updated_at: now() };
+  const job = {
+    id: randomUUID(),
+    video_id: req.params.id,
+    status: 'queued',
+    progress: 0,
+    message: '解析を待機中',
+    created_at: now(),
+    updated_at: now(),
+  };
   db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)').run(job.id, job.video_id, job.status, job.progress, job.message, job.created_at, job.updated_at);
-  void analyze(job.id, video);
+  void analyze(job.id, video, req.body);
   res.status(202).json(job);
 });
 
-// SSE (Server-Sent Events) エンドポイント: コネクション切断を防ぐ Keep-Alive ハートビートを実装
+// SSE (Server-Sent Events) エンドポイント
 app.get('/api/jobs/:id/stream', (req, res) => {
   req.socket.setTimeout(0);
   req.socket.setKeepAlive(true, 10000);
@@ -787,16 +784,24 @@ app.get('/api/jobs/:id/stream', (req, res) => {
   });
 });
 
-// 報告書生成エンドポイント: 非同期ジョブとして開始し、ストリーミング受信でリアルタイムに進捗更新
+// 報告書生成エンドポイント
 app.post('/api/videos/:id/report', (req, res) => {
   const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id);
   if (!video) return res.sendStatus(404);
   const events = db.prepare('SELECT 1 FROM events WHERE video_id=? LIMIT 1').get(req.params.id);
   if (!events) return res.status(400).json({ error: '先にイベントを解析してください' });
 
-  const job = { id: randomUUID(), video_id: req.params.id, status: 'queued', progress: 0, message: '報告書の生成を待機中', created_at: now(), updated_at: now() };
+  const job = {
+    id: randomUUID(),
+    video_id: req.params.id,
+    status: 'queued',
+    progress: 0,
+    message: '報告書の生成を待機中',
+    created_at: now(),
+    updated_at: now(),
+  };
   db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)').run(job.id, job.video_id, job.status, job.progress, job.message, job.created_at, job.updated_at);
-  void generateReport(job.id, video);
+  void generateReport(job.id, video, req.body);
   res.status(202).json(job);
 });
 

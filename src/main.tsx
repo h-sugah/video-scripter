@@ -4,7 +4,39 @@ import './style.css';
 
 type Project = { id: string; name: string; created_at: string; video_count: number };
 type Video = { id: string; name: string; duration: number | null; sha256: string; created_at: string };
-type Event = { id: string; start_time: number; end_time: number | null; event_type: string; description: string; objects_json: string; confidence: number | null; evidence_json: string };
+type Event = {
+  id: string;
+  start_time: number;
+  end_time: number | null;
+  event_type: string;
+  description: string;
+  objects_json: string;
+  confidence: number | null;
+  evidence_json: string;
+};
+
+type ProviderMeta = {
+  id: 'lmstudio' | 'openai' | 'anthropic' | 'google';
+  name: string;
+  capabilities: {
+    video_input: boolean;
+    image_input: boolean;
+    streaming: boolean;
+  };
+  defaultBaseUrl: string;
+  defaultModel: string;
+  popularModels: string[];
+};
+
+type ProfileMeta = {
+  id: 'operation' | 'seminar_education' | 'situation' | 'meeting' | 'custom';
+  name: string;
+  description: string;
+  icon: string;
+  targetEventsDescription: string;
+  defaultCustomPerceptionPrompt?: string;
+  defaultCustomReportPrompt?: string;
+};
 
 const api = async (path: string, init?: RequestInit) => {
   const r = await fetch('/api' + path, init);
@@ -25,14 +57,35 @@ function App() {
   const [events, setEvents] = useState<Event[]>([]);
   const [reports, setReports] = useState<any[]>([]);
   const [health, setHealth] = useState<any>();
-  const [settings, setSettings] = useState({
-    lmstudio_url: '',
-    lmstudio_model: '',
-    lmstudio_token: '',
-    lmstudio_token_configured: false,
-    clear_lmstudio_token: false,
+
+  // 設定関連
+  const [providersMeta, setProvidersMeta] = useState<ProviderMeta[]>([]);
+  const [profilesMeta, setProfilesMeta] = useState<ProfileMeta[]>([]);
+  const [activeProvider, setActiveProvider] = useState<'lmstudio' | 'openai' | 'anthropic' | 'google'>('lmstudio');
+  const [activeProfile, setActiveProfile] = useState<'operation' | 'seminar_education' | 'situation' | 'meeting' | 'custom'>('operation');
+  const [customPerceptionPrompt, setCustomPerceptionPrompt] = useState('');
+  const [customReportPrompt, setCustomReportPrompt] = useState('');
+  const [videoAnalysisMode, setVideoAnalysisMode] = useState<'auto' | 'direct' | 'frames'>('auto');
+
+  // プロバイダー設定フォーム用ステート
+  const [providerSettings, setProviderSettings] = useState<Record<string, { url: string; model: string; token: string; configured: boolean; clear_token?: boolean }>>({
+    lmstudio: { url: 'http://127.0.0.1:1234/v1', model: '', token: '', configured: false },
+    openai: { url: 'https://api.openai.com/v1', model: '', token: '', configured: false },
+    anthropic: { url: 'https://api.anthropic.com/v1', model: '', token: '', configured: false },
+    google: { url: 'https://generativelanguage.googleapis.com', model: '', token: '', configured: false },
   });
-  const [models, setModels] = useState<string[]>([]);
+
+  // 設定モーダル内の選択タブ
+  const [settingsTab, setSettingsTab] = useState<'providers' | 'profiles'>('providers');
+  const [selectedProviderInSettings, setSelectedProviderInSettings] = useState<'lmstudio' | 'openai' | 'anthropic' | 'google'>('lmstudio');
+  const [providerModelLists, setProviderModelLists] = useState<Record<string, string[]>>({});
+  const [isTestingConnection, setIsTestingConnection] = useState(false);
+
+  // 解析画面でのプロファイル・プロバイダー即時切り替え
+  const [executionProfile, setExecutionProfile] = useState<'operation' | 'seminar_education' | 'situation' | 'meeting' | 'custom'>('operation');
+  const [executionProvider, setExecutionProvider] = useState<'lmstudio' | 'openai' | 'anthropic' | 'google'>('lmstudio');
+  const [showCustomPromptEditor, setShowCustomPromptEditor] = useState(false);
+
   const [message, setMessage] = useState('');
   const [job, setJob] = useState<any>();
   const [report, setReport] = useState<any>();
@@ -44,10 +97,45 @@ function App() {
 
   const refreshProjects = useCallback(() => api('/projects').then(setProjects).catch(e => setMessage(e.message)), []);
 
+  const loadSettings = useCallback(async () => {
+    try {
+      const data = await api('/settings');
+      if (data.providers_meta) setProvidersMeta(data.providers_meta);
+      if (data.profiles) setProfilesMeta(data.profiles);
+      if (data.active_provider) {
+        setActiveProvider(data.active_provider);
+        setExecutionProvider(data.active_provider);
+        setSelectedProviderInSettings(data.active_provider);
+      }
+      if (data.active_profile) {
+        setActiveProfile(data.active_profile);
+        setExecutionProfile(data.active_profile);
+      }
+      if (data.custom_perception_prompt != null) setCustomPerceptionPrompt(data.custom_perception_prompt);
+      if (data.custom_report_prompt != null) setCustomReportPrompt(data.custom_report_prompt);
+      if (data.video_analysis_mode) setVideoAnalysisMode(data.video_analysis_mode);
+
+      if (data.provider_settings) {
+        setProviderSettings(prev => {
+          const next = { ...prev };
+          for (const [k, v] of Object.entries(data.provider_settings) as [string, any][]) {
+            next[k] = {
+              url: v.url ?? prev[k]?.url ?? '',
+              model: v.model ?? prev[k]?.model ?? '',
+              token: '',
+              configured: Boolean(v.configured),
+            };
+          }
+          return next;
+        });
+      }
+    } catch {}
+  }, []);
+
   useEffect(() => {
     refreshProjects();
     api('/health').then(setHealth).catch(() => {});
-    api('/settings').then(setSettings).catch(() => {});
+    loadSettings();
 
     return () => {
       if (activeStreamRef.current) {
@@ -55,7 +143,7 @@ function App() {
         activeStreamRef.current = null;
       }
     };
-  }, [refreshProjects]);
+  }, [refreshProjects, loadSettings]);
 
   const closeStream = useCallback(() => {
     if (activeStreamRef.current) {
@@ -96,7 +184,7 @@ function App() {
         if (['completed', 'failed'].includes(next.status)) {
           closeStream();
           if (next.status === 'completed') {
-            const isReportJob = typeof next.message === 'string' && next.message.includes('報告書');
+            const isReportJob = typeof next.message === 'string' && (next.message.includes('報告書') || next.message.includes('記録') || next.message.includes('議事録'));
             openVideo(targetVideoId, isReportJob);
           }
         }
@@ -104,7 +192,7 @@ function App() {
     };
 
     stream.onerror = () => {
-      // EventSource は自動再接続を試行するため何もしない
+      // 自動再接続待機
     };
   }, [closeStream, openVideo]);
 
@@ -144,9 +232,18 @@ function App() {
   const analyze = async () => {
     if (!videoId) return;
     try {
-      const j = await api('/videos/' + videoId + '/analyze', { method: 'POST' });
+      setMessage(`[${executionProfile}] 解析を開始しました…`);
+      const j = await api('/videos/' + videoId + '/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerId: executionProvider,
+          profileId: executionProfile,
+          customPerceptionPrompt: executionProfile === 'custom' ? customPerceptionPrompt : undefined,
+          mode: videoAnalysisMode,
+        }),
+      });
       setJob(j);
-      setMessage('解析を開始しました。');
       subscribeJob(j.id, videoId);
     } catch (e: any) {
       setMessage(e.message);
@@ -156,8 +253,16 @@ function App() {
   const createReport = async () => {
     if (!videoId) return;
     try {
-      setMessage('報告書の生成を開始しました…');
-      const j = await api('/videos/' + videoId + '/report', { method: 'POST' });
+      setMessage(`[${executionProfile}] 報告書の生成を開始しました…`);
+      const j = await api('/videos/' + videoId + '/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerId: executionProvider,
+          profileId: executionProfile,
+          customReportPrompt: executionProfile === 'custom' ? customReportPrompt : undefined,
+        }),
+      });
       setJob(j);
       subscribeJob(j.id, videoId);
     } catch (e: any) {
@@ -176,23 +281,72 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
-  const testConnection = async (silent = false) => {
+  const testProviderConnection = async (providerId: string, silent = false) => {
+    setIsTestingConnection(true);
     try {
-      if (!silent) setMessage('LM Studioへ接続しています…');
-      const result = await api('/lmstudio/test', { method: 'POST' });
-      setModels(result.models);
-      if (!settings.lmstudio_model && result.models[0]) {
-        setSettings(current => ({ ...current, lmstudio_model: result.models[0] }));
+      if (!silent) setMessage(`${providerId.toUpperCase()} へ接続テスト中…`);
+      const pSetting = providerSettings[providerId] || {};
+      const result = await api(`/providers/${providerId}/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: pSetting.url,
+          token: pSetting.token,
+          model: pSetting.model,
+        }),
+      });
+
+      if (result.models && result.models.length > 0) {
+        setProviderModelLists(prev => ({ ...prev, [providerId]: result.models }));
+        if (!pSetting.model || !result.models.includes(pSetting.model)) {
+          setProviderSettings(prev => ({
+            ...prev,
+            [providerId]: { ...prev[providerId], model: result.models[0] },
+          }));
+        }
+        if (!silent) setMessage(`接続成功: ${result.models.length}件の利用可能モデルを取得しました。`);
+      } else {
+        if (!silent) setMessage('接続に成功しました。');
       }
-      if (!silent) setMessage(`接続に成功しました。${result.models.length}件のモデルを取得しました。Vision対応モデルを選択して保存してください。`);
     } catch (e: any) {
-      if (!silent) setMessage(e.message);
+      if (!silent) setMessage(`接続失敗: ${e.message}`);
+    } finally {
+      setIsTestingConnection(false);
     }
   };
 
-  const openSettings = async () => {
+  const saveSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const payload: any = {
+        active_provider: activeProvider,
+        active_profile: activeProfile,
+        custom_perception_prompt: customPerceptionPrompt,
+        custom_report_prompt: customReportPrompt,
+        video_analysis_mode: videoAnalysisMode,
+        provider_settings: providerSettings,
+      };
+
+      await api('/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      setExecutionProvider(activeProvider);
+      setExecutionProfile(activeProfile);
+      setShowSettings(false);
+      setMessage('設定を保存しました。');
+      await loadSettings();
+    } catch (e: any) {
+      setMessage(e.message);
+    }
+  };
+
+  const openSettingsModal = async () => {
     setShowSettings(true);
-    await testConnection(true);
+    await loadSettings();
+    void testProviderConnection(selectedProviderInSettings, true);
   };
 
   const deleteVideo = async () => {
@@ -213,6 +367,8 @@ function App() {
   };
 
   const isWorking = job?.status === 'running' || job?.status === 'queued';
+  const activeProfileDef = profilesMeta.find(p => p.id === executionProfile) || profilesMeta[0];
+  const activeProviderDef = providersMeta.find(p => p.id === executionProvider) || providersMeta[0];
 
   return (
     <main>
@@ -220,11 +376,17 @@ function App() {
         <div>
           <span className="mark">▶</span>
           <strong>Video Scripter</strong>
-          <small> 根拠を残す作業映像分析</small>
+          <small> 根拠を残すマルチプロバイダー映像分析</small>
         </div>
         <div className="status">
-          {health?.ffmpeg ? <span>● FFmpeg</span> : <span className="danger">● FFmpeg未検出</span>}
-          <button className="ghost" onClick={openSettings}>⚙ 設定</button>
+          {health?.ffmpeg && health?.ffprobe ? (
+            <span className="ready">● FFmpeg / ffprobe稼働中</span>
+          ) : (
+            <span className="danger">
+              ● {!health?.ffmpeg && !health?.ffprobe ? 'FFmpeg / ffprobe未検出' : !health?.ffmpeg ? 'FFmpeg未検出' : 'ffprobe未検出'}
+            </span>
+          )}
+          <button className="ghost" onClick={openSettingsModal}>⚙ 設定・プロファイル</button>
         </div>
       </header>
 
@@ -239,21 +401,64 @@ function App() {
               <small>{p.video_count} 本の動画</small>
             </button>
           ))}
+
           <hr />
-          <h3>AIプロバイダー</h3>
-          <div className="providers">
-            <span className="ready">● LM Studio <small>実動</small></span>
-            <span>○ Gemini <small>＜将来実装予定＞</small></span>
-            <span>○ OpenAI <small>＜将来実装予定＞</small></span>
-            <span>○ Anthropic <small>＜将来実装予定＞</small></span>
+          <h3>AI プロバイダー</h3>
+          <div className="provider-status-list">
+            {providersMeta.map(p => {
+              const isCurrent = executionProvider === p.id;
+              const hasConfig = p.id === 'lmstudio' ? true : providerSettings[p.id]?.configured;
+              return (
+                <div
+                  key={p.id}
+                  className={`provider-chip ${isCurrent ? 'active' : ''}`}
+                  onClick={() => {
+                    setExecutionProvider(p.id);
+                    setActiveProvider(p.id);
+                  }}
+                  title={p.capabilities.video_input ? '動画直接入力 & 画像入力対応' : '画像入力対応'}
+                >
+                  <div className="p-header">
+                    <span className={hasConfig || p.id === 'lmstudio' ? 'dot-ready' : 'dot-unconfigured'}>●</span>
+                    <b>{p.id === 'lmstudio' ? 'LM Studio' : p.name.replace(/\s*\(.*/, '')}</b>
+                    {isCurrent && <span className="badge-active">選択中</span>}
+                  </div>
+                  <div className="p-caps">
+                    {p.capabilities.video_input ? (
+                      <span className="cap video">動画直接+画像</span>
+                    ) : (
+                      <span className="cap image">画像フレーム</span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <hr />
+          <h3>解析プロファイル</h3>
+          <div className="profile-selector-sidebar">
+            {profilesMeta.map(pr => (
+              <button
+                key={pr.id}
+                className={`profile-btn ${executionProfile === pr.id ? 'active' : ''}`}
+                onClick={() => {
+                  setExecutionProfile(pr.id);
+                  setActiveProfile(pr.id);
+                }}
+              >
+                <span className="p-icon">{pr.icon}</span>
+                <span className="p-title">{pr.name}</span>
+              </button>
+            ))}
           </div>
         </aside>
 
         <section className="content">
           {!selected ? (
             <div className="empty">
-              <h1>映像を、検証できる作業記録へ。</h1>
-              <p>プロジェクトを作成し、作業動画をアップロードしてください。</p>
+              <h1>映像を、検証できる構造化記録へ。</h1>
+              <p>プロジェクトを作成し、作業動画や講義・定点カメラ・現地の映像をアップロードしてください。</p>
               <button className="primary" onClick={newProject}>プロジェクトを作成</button>
             </div>
           ) : !videoId ? (
@@ -289,10 +494,87 @@ function App() {
                 </div>
                 <div className="actions">
                   <button onClick={analyze} className="primary" disabled={isWorking}>✦ 解析開始</button>
-                  <button onClick={createReport} disabled={!events.length || isWorking}>報告書を生成</button>
+                  <button onClick={createReport} disabled={!events.length || isWorking}>報告書・記録を生成</button>
                   <button className="delete" onClick={deleteVideo} disabled={isWorking}>削除</button>
                 </div>
               </div>
+
+              {/* プロファイル & プロバイダー即時選択コントロールバー */}
+              <div className="control-bar">
+                <div className="control-group">
+                  <label>解析プロファイル:</label>
+                  <select
+                    value={executionProfile}
+                    onChange={e => setExecutionProfile(e.target.value as any)}
+                    disabled={isWorking}
+                  >
+                    {profilesMeta.map(p => (
+                      <option key={p.id} value={p.id}>{p.icon} {p.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="control-group">
+                  <label>AIプロバイダー:</label>
+                  <select
+                    value={executionProvider}
+                    onChange={e => setExecutionProvider(e.target.value as any)}
+                    disabled={isWorking}
+                  >
+                    {providersMeta.map(p => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {activeProviderDef?.capabilities.video_input && (
+                  <div className="control-group">
+                    <label>動画入力方式:</label>
+                    <select
+                      value={videoAnalysisMode}
+                      onChange={e => setVideoAnalysisMode(e.target.value as any)}
+                      disabled={isWorking}
+                    >
+                      <option value="auto">自動 (Gemini File API直接送信)</option>
+                      <option value="direct">動画直接送信 (Gemini Video)</option>
+                      <option value="frames">フレーム抽出方式 (画像バッチ)</option>
+                    </select>
+                  </div>
+                )}
+
+                {executionProfile === 'custom' && (
+                  <button
+                    className="ghost toggle-custom-btn"
+                    onClick={() => setShowCustomPromptEditor(!showCustomPromptEditor)}
+                  >
+                    {showCustomPromptEditor ? '▲ カスタム指示を隠す' : '▼ カスタム指示を編集'}
+                  </button>
+                )}
+              </div>
+
+              {/* カスタムプロファイルのプロンプト編集フォーム */}
+              {executionProfile === 'custom' && showCustomPromptEditor && (
+                <div className="custom-prompt-panel">
+                  <div className="field">
+                    <label>【カスタム】映像解析・イベント抽出の観点指示:</label>
+                    <textarea
+                      rows={3}
+                      placeholder="例: 作業者の手の動きと使用した機器、工具のみを抽出してください。"
+                      value={customPerceptionPrompt}
+                      onChange={e => setCustomPerceptionPrompt(e.target.value)}
+                    />
+                  </div>
+                  <div className="field">
+                    <label>【カスタム】報告書・記録の構成要件指示:</label>
+                    <textarea
+                      rows={3}
+                      placeholder="例: 見出し構成を「概要」「時系列手順」「留意事項」とし、箇条書きで出力してください。"
+                      value={customReportPrompt}
+                      onChange={e => setCustomReportPrompt(e.target.value)}
+                    />
+                  </div>
+                </div>
+              )}
 
               {job && (
                 <div className={'job ' + job.status}>
@@ -309,11 +591,13 @@ function App() {
               <div className="work">
                 <div className="timeline">
                   <div className="panel-head">
-                    <h2>時系列イベント</h2>
+                    <h2>時系列イベント（{activeProfileDef?.name || '解析結果'}）</h2>
                     <span>{events.length} 件</span>
                   </div>
                   {events.length === 0 ? (
-                    <div className="empty small">解析を開始すると、根拠付きのイベントがここに表示されます。</div>
+                    <div className="empty small">
+                      「✦ 解析開始」をクリックすると、選択したプロファイルとAIプロバイダーで根拠付きイベントが抽出されます。
+                    </div>
                   ) : (
                     events.map(e => {
                       const ev = JSON.parse(e.evidence_json || '{}');
@@ -324,10 +608,22 @@ function App() {
                           <div>
                             <b>{e.description}</b>
                             <p>
-                              {objects.join(' · ') || e.event_type}
-                              <span>信頼度 {Math.round((e.confidence || 0) * 100)}%</span>
+                              {objects.length > 0 ? (
+                                <span className="objects-tags">
+                                  {objects.map((obj: string, i: number) => (
+                                    <span key={i} className="tag">{obj}</span>
+                                  ))}
+                                </span>
+                              ) : (
+                                <span className="tag type-tag">{e.event_type}</span>
+                              )}
+                              <span className="conf">信頼度 {Math.round((e.confidence || 0) * 100)}%</span>
                             </p>
-                            {ev.frame && <a href={'/media/' + ev.frame} target="_blank" rel="noreferrer">根拠フレーム #{ev.frame_index} を表示</a>}
+                            {ev.frame && (
+                              <a href={'/media/' + ev.frame} target="_blank" rel="noreferrer">
+                                根拠フレーム #{ev.frame_index} を表示
+                              </a>
+                            )}
                           </div>
                         </article>
                       );
@@ -339,26 +635,28 @@ function App() {
                   <div className="panel-head">
                     <h2>Evidence Chain</h2>
                   </div>
-                  <p>各イベントは、動画ハッシュ・モデル設定・抽出フレーム・推定時刻と結び付けて保存されます。</p>
+                  <p>各イベントは、動画ハッシュ・モデル・抽出フレーム・推定時刻と結び付けて監査ログに保存されます。</p>
                   <dl>
-                    <dt>映像</dt>
+                    <dt>映像ファイル</dt>
                     <dd>{current?.name}</dd>
-                    <dt>フレーム</dt>
-                    <dd>イベントのリンクから確認</dd>
-                    <dt>音声</dt>
-                    <dd>初期版では未解析</dd>
-                    <dt>AI</dt>
-                    <dd>LM Studio / {settings.lmstudio_model || '未選択'}</dd>
+                    <dt>解析プロファイル</dt>
+                    <dd>{activeProfileDef?.icon} {activeProfileDef?.name}</dd>
+                    <dt>使用AIプロバイダー</dt>
+                    <dd>{activeProviderDef?.name} ({providerSettings[executionProvider]?.model || activeProviderDef?.defaultModel || 'デフォルト'})</dd>
+                    <dt>入力Capability</dt>
+                    <dd>{activeProviderDef?.capabilities.video_input ? '動画直接入力 (Gemini)' : '画像フレームバッチ'}</dd>
+                    <dt>証跡フレーム</dt>
+                    <dd>イベントのリンクから常時検証可能</dd>
                   </dl>
                 </div>
               </div>
 
               {reports.length > 0 && (
                 <div className="reports">
-                  <h2>報告書</h2>
+                  <h2>生成された報告書・記録</h2>
                   {reports.map(r => (
                     <button key={r.id} onClick={async () => setReport(await api('/reports/' + r.id))}>
-                      {r.title} <small>{new Date(r.created_at).toLocaleString()}</small>
+                      📄 {r.title} <small>{new Date(r.created_at).toLocaleString()}</small>
                     </button>
                   ))}
                 </div>
@@ -370,75 +668,201 @@ function App() {
 
       {message && <div className="toast" onClick={() => setMessage('')}>{message}</div>}
 
+      {/* 報告書表示モーダル */}
       {report && (
         <div className="modal">
           <div className="sheet">
             <button className="close" onClick={() => setReport(null)}>×</button>
             <h2>{report.title}</h2>
-            <button className="download" onClick={downloadReport}>↓ Markdownをダウンロード</button>
+            <div className="modal-actions-bar">
+              <button className="primary download" onClick={downloadReport}>↓ Markdownをダウンロード</button>
+            </div>
             <pre>{report.markdown}</pre>
           </div>
         </div>
       )}
 
+      {/* 設定・プロファイル管理モーダル */}
       {showSettings && (
         <div className="modal">
-          <form
-            className="sheet settings"
-            onSubmit={async e => {
-              e.preventDefault();
-              await api('/settings', {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settings)
-              });
-              setShowSettings(false);
-              setMessage('設定を保存しました。');
-            }}
-          >
+          <form className="sheet settings-modal" onSubmit={saveSettings}>
             <button type="button" className="close" onClick={() => setShowSettings(false)}>×</button>
-            <h2>LM Studio 設定</h2>
-            <label>
-              サーバーURL
-              <input value={settings.lmstudio_url} onChange={e => setSettings({ ...settings, lmstudio_url: e.target.value })} />
-            </label>
-            <label>
-              Vision対応モデル
-              <select required value={settings.lmstudio_model} onChange={e => setSettings({ ...settings, lmstudio_model: e.target.value })}>
-                <option value="" disabled>
-                  {models.length ? 'モデルを選択してください' : 'ロード済みモデルを取得中です…'}
-                </option>
-                {models.map(model => (
-                  <option key={model} value={model}>{model}</option>
-                ))}
-              </select>
-            </label>
-            <p className="hint model-count">LM Studioで取得したロード済みモデル: {models.length} 件</p>
-            <label>
-              APIトークン（必要な場合のみ）
-              <input
-                type="password"
-                placeholder={settings.lmstudio_token_configured ? '設定済み（変更する場合のみ入力）' : 'LM StudioのAPIトークン'}
-                value={settings.lmstudio_token}
-                onChange={e => setSettings({ ...settings, lmstudio_token: e.target.value })}
-              />
-            </label>
-            {settings.lmstudio_token_configured && (
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={settings.clear_lmstudio_token}
-                  onChange={e => setSettings({ ...settings, clear_lmstudio_token: e.target.checked })}
-                />
-                保存済みトークンを削除する
-              </label>
+            <h2>設定 & 解析プロファイル</h2>
+
+            <div className="settings-tabs">
+              <button
+                type="button"
+                className={`tab-btn ${settingsTab === 'providers' ? 'active' : ''}`}
+                onClick={() => setSettingsTab('providers')}
+              >
+                🤖 AIプロバイダー設定
+              </button>
+              <button
+                type="button"
+                className={`tab-btn ${settingsTab === 'profiles' ? 'active' : ''}`}
+                onClick={() => setSettingsTab('profiles')}
+              >
+                📋 解析プロファイル設定
+              </button>
+            </div>
+
+            {settingsTab === 'providers' ? (
+              <div className="provider-settings-section">
+                <div className="provider-sub-tabs">
+                  {providersMeta.map(p => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      className={`sub-tab-btn ${selectedProviderInSettings === p.id ? 'active' : ''}`}
+                      onClick={() => {
+                        setSelectedProviderInSettings(p.id);
+                        void testProviderConnection(p.id, true);
+                      }}
+                    >
+                      {p.name}
+                    </button>
+                  ))}
+                </div>
+
+                {(() => {
+                  const pid = selectedProviderInSettings;
+                  const meta = providersMeta.find(p => p.id === pid);
+                  const pConfig = providerSettings[pid] || { url: '', model: '', token: '', configured: false };
+                  const modelList = providerModelLists[pid] || meta?.popularModels || [];
+
+                  return (
+                    <div className="provider-edit-pane">
+                      <div className="cap-notice">
+                        <strong>Capability: </strong>
+                        {meta?.capabilities.video_input ? (
+                          <span className="badge cap-video">🎬 動画直接入力 (video_input = true) & 画像入力 (image_input = true)</span>
+                        ) : (
+                          <span className="badge cap-image">🖼 画像フレーム入力 (video_input = false, image_input = true)</span>
+                        )}
+                        <span className="badge cap-stream">⚡ ストリーミング対応</span>
+                      </div>
+
+                      <label>
+                        API エンドポイント URL
+                        <input
+                          value={pConfig.url}
+                          onChange={e => setProviderSettings({
+                            ...providerSettings,
+                            [pid]: { ...pConfig, url: e.target.value },
+                          })}
+                          placeholder={meta?.defaultBaseUrl}
+                        />
+                      </label>
+
+                      <label>
+                        使用モデル
+                        <div className="model-select-group">
+                          <input
+                            list={`models-list-${pid}`}
+                            value={pConfig.model}
+                            onChange={e => setProviderSettings({
+                              ...providerSettings,
+                              [pid]: { ...pConfig, model: e.target.value },
+                            })}
+                            placeholder="モデル名を入力または選択"
+                          />
+                          <datalist id={`models-list-${pid}`}>
+                            {modelList.map(m => (
+                              <option key={m} value={m} />
+                            ))}
+                          </datalist>
+                        </div>
+                      </label>
+
+                      <label>
+                        API トークン / API キー
+                        <input
+                          type="password"
+                          placeholder={pConfig.configured ? '設定済み（変更する場合のみ入力）' : `${meta?.name} のAPIキー / トークン`}
+                          value={pConfig.token}
+                          onChange={e => setProviderSettings({
+                            ...providerSettings,
+                            [pid]: { ...pConfig, token: e.target.value },
+                          })}
+                        />
+                      </label>
+
+                      {pConfig.configured && (
+                        <label className="check">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(pConfig.clear_token)}
+                            onChange={e => setProviderSettings({
+                              ...providerSettings,
+                              [pid]: { ...pConfig, clear_token: e.target.checked },
+                            })}
+                          />
+                          保存済みAPIキー/トークンを削除する
+                        </label>
+                      )}
+
+                      <div className="provider-actions">
+                        <button
+                          type="button"
+                          disabled={isTestingConnection}
+                          onClick={() => testProviderConnection(pid, false)}
+                        >
+                          {isTestingConnection ? '接続確認中…' : '🔄 接続を確認・モデル一覧を取得'}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            ) : (
+              <div className="profile-settings-section">
+                <div className="profile-cards-grid">
+                  {profilesMeta.map(pr => (
+                    <div
+                      key={pr.id}
+                      className={`profile-card ${activeProfile === pr.id ? 'selected' : ''}`}
+                      onClick={() => setActiveProfile(pr.id)}
+                    >
+                      <div className="card-top">
+                        <span className="icon">{pr.icon}</span>
+                        <b>{pr.name}</b>
+                        {activeProfile === pr.id && <span className="default-badge">デフォルト</span>}
+                      </div>
+                      <p className="card-desc">{pr.description}</p>
+                      <div className="card-target">
+                        <small>抽出対象: {pr.targetEventsDescription}</small>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="custom-profile-fields">
+                  <h3>カスタムプロファイルのデフォルト指示</h3>
+                  <label>
+                    カスタム解析観点プロンプト（映像から何を抽出するか）
+                    <textarea
+                      rows={3}
+                      value={customPerceptionPrompt}
+                      onChange={e => setCustomPerceptionPrompt(e.target.value)}
+                      placeholder="例: 作業者の手順と使用した器具、状態変化を時系列で抽出してください。"
+                    />
+                  </label>
+                  <label>
+                    カスタム報告書構成プロンプト（どのようなレポートを作成するか）
+                    <textarea
+                      rows={3}
+                      value={customReportPrompt}
+                      onChange={e => setCustomReportPrompt(e.target.value)}
+                      placeholder="例: 「概要」「作業詳細」「改善提案」の見出しで整理してください。"
+                    />
+                  </label>
+                </div>
+              </div>
             )}
-            <p className="hint">
-              設定画面を開くと、LM Studioのロード済みモデルを自動取得します。表示されないモデルは、LM Studio側でロードしてから「接続を確認」を押してください。テキスト専用モデルでは動画の内容を解析できません。
-            </p>
+
             <div className="setting-actions">
-              <button type="button" onClick={() => testConnection(false)}>接続を確認</button>
-              <button className="primary">保存</button>
+              <button type="button" onClick={() => setShowSettings(false)}>キャンセル</button>
+              <button className="primary" type="submit">設定を保存</button>
             </div>
           </form>
         </div>
