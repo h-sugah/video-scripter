@@ -22,6 +22,7 @@ export interface VisionBatchParams {
   batchFiles: string[];
   folder: string;
   onProgress?: (tokenCount: number) => void;
+  signal?: AbortSignal;
 }
 
 export interface VideoDirectParams {
@@ -32,12 +33,14 @@ export interface VideoDirectParams {
   mimeType: string;
   duration?: number;
   onProgress?: (message: string) => void;
+  signal?: AbortSignal;
 }
 
 export interface TextGenerationParams {
   config: ProviderConfig;
   prompt: string;
   onProgress?: (tokenCount: number) => void;
+  signal?: AbortSignal;
 }
 
 export interface AIProvider {

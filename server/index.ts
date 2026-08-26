@@ -37,11 +37,25 @@ const db = new DatabaseSync(join(data, 'video-scripter.sqlite'));
 db.exec(`PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS videos (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, duration REAL, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, video_id TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, video_id TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, type TEXT DEFAULT 'analyze', state_json TEXT);
 CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, video_id TEXT NOT NULL, start_time REAL NOT NULL, end_time REAL, event_type TEXT NOT NULL, description TEXT NOT NULL, objects_json TEXT NOT NULL, confidence REAL, evidence_json TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, video_id TEXT NOT NULL, title TEXT NOT NULL, markdown TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ai_audits (id TEXT PRIMARY KEY, video_id TEXT NOT NULL, stage TEXT NOT NULL, model TEXT NOT NULL, prompt TEXT NOT NULL, response TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+
+// jobs テーブルのマイグレーション確認（既存DBとの互換性確保）
+try {
+  const tableInfo = db.prepare('PRAGMA table_info(jobs)').all() as { name: string }[];
+  const cols = new Set(tableInfo.map(c => c.name));
+  if (!cols.has('type')) {
+    db.exec("ALTER TABLE jobs ADD COLUMN type TEXT DEFAULT 'analyze'");
+  }
+  if (!cols.has('state_json')) {
+    db.exec('ALTER TABLE jobs ADD COLUMN state_json TEXT');
+  }
+} catch (e) {
+  console.warn('jobsテーブルのマイグレーション確認中に警告が発生しました:', e);
+}
 
 // 保存された動画パスの自動修復（異なる環境間での同期やフォルダ移動に対応）
 try {
@@ -96,13 +110,17 @@ app.use('/media', express.static(data));
 
 const upload = multer({ dest: join(data, 'incoming'), limits: { fileSize: 10 * 1024 * 1024 * 1024 } });
 const subscribers = new Map<string, Set<express.Response>>();
+const jobAbortControllers = new Map<string, AbortController>();
 
-function updateJob(id: string, progress: number, message: string, status?: string) {
-  const existing = db.prepare('SELECT status FROM jobs WHERE id=?').get(id) as any;
-  db.prepare('UPDATE jobs SET progress=?,message=?,status=?,updated_at=? WHERE id=?').run(
+function updateJob(id: string, progress: number, message: string, status?: string, stateJson?: string | null) {
+  const existing = db.prepare('SELECT status, state_json FROM jobs WHERE id=?').get(id) as any;
+  const newStatus = status ?? existing?.status ?? 'running';
+  const newState = stateJson !== undefined ? stateJson : (existing?.state_json ?? null);
+  db.prepare('UPDATE jobs SET progress=?,message=?,status=?,state_json=?,updated_at=? WHERE id=?').run(
     progress,
     message,
-    status ?? existing?.status ?? 'running',
+    newStatus,
+    newState,
     now(),
     id
   );
@@ -231,58 +249,97 @@ ${lines.join('\n')}
 ${reason ? `\n> 注記: AIモデルによる文章整形が利用できなかったため、イベントデータから直接生成しています（${reason}）。` : ''}`;
 }
 
+interface AnalyzeResumeState {
+  completedBatches: number;
+  events: any[];
+  files: string[];
+  interval: number;
+  duration: number;
+  totalBatches: number;
+}
+
+interface AnalyzeOptions {
+  providerId?: ProviderId;
+  profileId?: ProfileId;
+  customPerceptionPrompt?: string;
+  mode?: 'auto' | 'direct' | 'frames';
+  resumeState?: AnalyzeResumeState;
+}
+
 // 動画解析処理オーケストレーター
 async function analyze(
   jobId: string,
   video: any,
-  options?: { providerId?: ProviderId; profileId?: ProfileId; customPerceptionPrompt?: string; mode?: 'auto' | 'direct' | 'frames' }
+  options?: AnalyzeOptions,
+  signal?: AbortSignal
 ) {
+  const providerId = (options?.providerId || getSetting('active_provider', 'lmstudio')) as ProviderId;
+  const profileId = (options?.profileId || getSetting('active_profile', 'operation')) as ProfileId;
+  const customPrompt = options?.customPerceptionPrompt ?? getSetting('custom_perception_prompt', '');
+  const mode = options?.mode || (getSetting('video_analysis_mode', 'auto') as 'auto' | 'direct' | 'frames');
+
+  const provider = getProvider(providerId);
+  const providerConfig = getProviderConfig(providerId);
+  const profile = getProfile(profileId);
+
+  let duration = options?.resumeState?.duration || 0;
+  let files: string[] = options?.resumeState?.files || [];
+  let interval = options?.resumeState?.interval || 1;
+  let totalBatches = options?.resumeState?.totalBatches || 0;
+  let completedBatchCount = options?.resumeState?.completedBatches || 0;
+  const allEvents: any[] = options?.resumeState?.events ? [...options.resumeState.events] : [];
+  let currentProgress = options?.resumeState ? Math.min(90, Math.round(20 + (completedBatchCount / Math.max(1, totalBatches)) * 75)) : 5;
+
+  const folder = join(framesRoot, video.id);
+
   try {
+    const checkAbort = () => {
+      if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
+    };
+
     const resolvedPath = resolveVideoPath(video);
-    updateJob(jobId, 5, '動画情報を確認しています');
-    const duration = await probeDuration(resolvedPath);
-    db.prepare('UPDATE videos SET duration=? WHERE id=?').run(duration, video.id);
+    checkAbort();
 
-    const providerId = (options?.providerId || getSetting('active_provider', 'lmstudio')) as ProviderId;
-    const profileId = (options?.profileId || getSetting('active_profile', 'operation')) as ProfileId;
-    const customPrompt = options?.customPerceptionPrompt ?? getSetting('custom_perception_prompt', '');
-    const mode = options?.mode || (getSetting('video_analysis_mode', 'auto') as 'auto' | 'direct' | 'frames');
+    // 再開時でない場合は動画メタデータ取得とフレーム抽出を実施
+    if (!options?.resumeState || !files.length) {
+      updateJob(jobId, 5, '動画情報を確認しています');
+      duration = await probeDuration(resolvedPath);
+      db.prepare('UPDATE videos SET duration=? WHERE id=?').run(duration, video.id);
 
-    const provider = getProvider(providerId);
-    const providerConfig = getProviderConfig(providerId);
-    const profile = getProfile(profileId);
+      checkAbort();
+      updateJob(jobId, 10, '代表フレームを抽出しています');
+      mkdirSync(folder, { recursive: true });
 
-    updateJob(jobId, 10, '代表フレームを抽出しています');
-    const folder = join(framesRoot, video.id);
-    mkdirSync(folder, { recursive: true });
+      // 既存フレームのクリーンアップ
+      const existing = readdirSync(folder);
+      for (const f of existing) {
+        try { rmSync(join(folder, f)); } catch {}
+      }
 
-    // 既存フレームのクリーンアップ
-    const existing = readdirSync(folder);
-    for (const f of existing) {
-      try { rmSync(join(folder, f)); } catch {}
+      // 証跡・フォールバック用フレーム抽出
+      const count = Math.max(6, Math.ceil(duration / 15));
+      interval = Math.max(1, duration / count);
+      await command('ffmpeg', [
+        '-y',
+        '-i',
+        resolvedPath,
+        '-vf',
+        `fps=1/${interval},scale='min(1080,iw)':-2`,
+        '-frames:v',
+        String(count),
+        join(folder, 'frame-%03d.jpg'),
+      ]);
+
+      checkAbort();
+      files = readdirSync(folder).filter(x => x.endsWith('.jpg')).sort();
+      if (!files.length) throw new Error('フレーム画像を抽出できませんでした。');
+    } else {
+      updateJob(jobId, currentProgress, `中断された解析を再開しています (区間 ${completedBatchCount + 1}/${totalBatches} より)...`);
     }
-
-    // 証跡・フォールバック用フレーム抽出
-    const count = Math.max(6, Math.ceil(duration / 15));
-    const interval = Math.max(1, duration / count);
-    await command('ffmpeg', [
-      '-y',
-      '-i',
-      resolvedPath,
-      '-vf',
-      `fps=1/${interval},scale='min(1080,iw)':-2`,
-      '-frames:v',
-      String(count),
-      join(folder, 'frame-%03d.jpg'),
-    ]);
-
-    const files = readdirSync(folder).filter(x => x.endsWith('.jpg')).sort();
-    if (!files.length) throw new Error('フレーム画像を抽出できませんでした。');
-
-    const allEvents: any[] = [];
 
     // Geminiなど、Capabilityとしてvideo_input = true を持ち、モードが direct / auto の場合
     if (provider.capabilities.video_input && mode !== 'frames' && provider.analyzeVideoDirect) {
+      checkAbort();
       updateJob(jobId, 20, `${provider.name} に動画を送信して直接解析を開始します...`);
 
       const prompt = buildDirectVideoPrompt({
@@ -302,6 +359,7 @@ async function analyze(
         onProgress: (msg) => {
           updateJob(jobId, 45, msg);
         },
+        signal,
       });
 
       db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
@@ -320,7 +378,6 @@ async function analyze(
       for (const ev of directEvents) {
         const st = seconds(ev.start_time);
         const et = ev.end_time == null ? null : seconds(ev.end_time);
-        // フレーム番号を計算 (1-indexed)
         const frameIdx = Math.max(1, Math.min(files.length, Math.round(st / interval) + 1));
         allEvents.push({
           ...ev,
@@ -332,9 +389,11 @@ async function analyze(
     } else {
       // フレーム画像バッチ方式 (LM Studio, OpenAI, Claude, またはフレーム指定時)
       const BATCH_SIZE = 4;
-      const totalBatches = Math.ceil(files.length / BATCH_SIZE);
+      totalBatches = Math.ceil(files.length / BATCH_SIZE);
 
-      for (let b = 0; b < totalBatches; b++) {
+      for (let b = completedBatchCount; b < totalBatches; b++) {
+        checkAbort();
+
         const batchFiles = files.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
         const batchStartIndex = b * BATCH_SIZE + 1; // 1-indexed
         const batchEndIndex = batchStartIndex + batchFiles.length - 1;
@@ -342,9 +401,9 @@ async function analyze(
         const batchStartTime = (batchStartIndex - 1) * interval;
         const batchEndTime = Math.min(duration, batchEndIndex * interval);
 
-        const progress = Math.round(20 + (b / totalBatches) * 75);
+        currentProgress = Math.round(20 + (b / totalBatches) * 75);
         const rangeStr = `${formatDuration(batchStartTime)}〜${formatDuration(batchEndTime)}`;
-        updateJob(jobId, progress, `[${profile.name}] 区間 ${b + 1}/${totalBatches} (${rangeStr}) の${batchFiles.length}フレームを ${provider.name} で解析中...`);
+        updateJob(jobId, currentProgress, `[${profile.name}] 区間 ${b + 1}/${totalBatches} (${rangeStr}) の${batchFiles.length}フレームを ${provider.name} で解析中...`);
 
         const prompt = buildPerceptionPrompt({
           profileId,
@@ -364,8 +423,9 @@ async function analyze(
           batchFiles,
           folder,
           onProgress: (tokenCount) => {
-            updateJob(jobId, progress, `[${profile.name}] 区間 ${b + 1}/${totalBatches} (${rangeStr}) 解析中 (${tokenCount}トークン)...`);
+            updateJob(jobId, currentProgress, `[${profile.name}] 区間 ${b + 1}/${totalBatches} (${rangeStr}) 解析中 (${tokenCount}トークン)...`);
           },
+          signal,
         });
 
         db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
@@ -404,6 +464,24 @@ async function analyze(
             end_time: et,
           });
         }
+
+        completedBatchCount = b + 1;
+        currentProgress = Math.round(20 + (completedBatchCount / totalBatches) * 75);
+
+        // 各バッチ完了時のスナップショットを state_json に保持
+        const batchStateJson = JSON.stringify({
+          providerId,
+          profileId,
+          customPerceptionPrompt: customPrompt,
+          mode,
+          completedBatches: completedBatchCount,
+          events: allEvents,
+          files,
+          interval,
+          duration,
+          totalBatches,
+        });
+        updateJob(jobId, currentProgress, `[${profile.name}] 区間 ${completedBatchCount}/${totalBatches} (${rangeStr}) 解析完了`, 'running', batchStateJson);
       }
     }
 
@@ -439,20 +517,86 @@ async function analyze(
       );
     }
 
-    updateJob(jobId, 100, `【${profile.name}】${allEvents.length}件のイベントを抽出しました（${provider.name}）`, 'completed');
+    updateJob(jobId, 100, `【${profile.name}】${allEvents.length}件のイベントを抽出しました（${provider.name}）`, 'completed', null);
   } catch (error: any) {
-    const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
-    updateJob(jobId, 0, `${error.message}${cause}`, 'failed');
+    const isAbort = error?.name === 'AbortError';
+    const currentJob = db.prepare('SELECT status FROM jobs WHERE id=?').get(jobId) as any;
+    const isPaused = currentJob?.status === 'paused';
+
+    if (isAbort && isPaused) {
+      // 中断（paused）: 中断時点のスナップショットを保存
+      const savedState = JSON.stringify({
+        providerId,
+        profileId,
+        customPerceptionPrompt: customPrompt,
+        mode,
+        completedBatches: completedBatchCount,
+        events: allEvents,
+        files,
+        interval,
+        duration,
+        totalBatches: totalBatches || Math.ceil(files.length / 4),
+      });
+
+      // すでに抽出できたイベントがあれば events テーブルにも一時反映
+      if (allEvents.length > 0) {
+        try {
+          db.prepare('DELETE FROM events WHERE video_id=?').run(video.id);
+          const insert = db.prepare('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?)');
+          for (const event of allEvents) {
+            const idx = Math.max(1, Math.min(files.length, Math.round(Number(event.frame_index) || 1)));
+            const start = seconds(event.start_time);
+            insert.run(
+              randomUUID(),
+              video.id,
+              start,
+              event.end_time == null ? null : seconds(event.end_time),
+              String(event.event_type || 'other'),
+              String(event.description || '内容不明'),
+              JSON.stringify(Array.isArray(event.objects) ? event.objects : []),
+              Math.max(0, Math.min(1, Number(event.confidence) || 0.8)),
+              JSON.stringify({
+                frame: `frames/${video.id}/${files[idx - 1]}`,
+                frame_index: idx,
+                approximate_time: (idx - 0.5) * interval,
+                provider: provider.name,
+                profile: profile.name,
+              }),
+              now()
+            );
+          }
+        } catch {}
+      }
+
+      const batchMsg = totalBatches > 0 ? ` (${completedBatchCount}/${totalBatches}区間完了)` : '';
+      updateJob(
+        jobId,
+        currentProgress || 20,
+        `解析を中断しました${batchMsg}。「再開」ボタンで続きから処理できます。`,
+        'paused',
+        savedState
+      );
+    } else if (isAbort) {
+      // キャンセル（cancelled）
+      updateJob(jobId, 0, '解析をキャンセルしました。', 'cancelled', null);
+    } else {
+      const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
+      updateJob(jobId, 0, `${error.message}${cause}`, 'failed', null);
+    }
+  } finally {
+    jobAbortControllers.delete(jobId);
   }
 }
 
-// 報告書生成処理オーケストレーター
+// 報告書生成処理オーケストレーター（キャンセル対応・再開なし）
 async function generateReport(
   jobId: string,
   video: any,
-  options?: { providerId?: ProviderId; profileId?: ProfileId; customReportPrompt?: string }
+  options?: { providerId?: ProviderId; profileId?: ProfileId; customReportPrompt?: string },
+  signal?: AbortSignal
 ) {
   try {
+    if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
     updateJob(jobId, 10, '観測イベントを確認しています');
     const events = db.prepare('SELECT * FROM events WHERE video_id=? ORDER BY start_time').all(video.id) as any[];
     if (!events.length) throw new Error('先にイベントを解析してください');
@@ -481,6 +625,7 @@ async function generateReport(
       customPrompt,
     });
 
+    if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
     updateJob(jobId, 25, `${provider.name} で【${profile.name}】の報告書を生成中...`);
 
     let markdown = '';
@@ -494,6 +639,7 @@ async function generateReport(
           const p = Math.min(90, 25 + Math.floor(tokenCount / 8));
           updateJob(jobId, p, `報告書を生成中 (${provider.name}: ${tokenCount}トークン)...`);
         },
+        signal,
       });
 
       db.prepare('INSERT INTO ai_audits VALUES (?,?,?,?,?,?,?)').run(
@@ -510,10 +656,13 @@ async function generateReport(
       markdown = cleaned.replace(/^```(?:markdown)?\s*/i, '').replace(/\s*```$/, '').trim();
       if (!markdown) throw new Error(`${provider.name} が有効な報告書本文を返しませんでした`);
     } catch (err: any) {
+      // AbortError は上位にそのまま伝播させる
+      if (err?.name === 'AbortError') throw err;
       fallbackReason = err.message;
       markdown = reportFallback(video, events, profileId, fallbackReason);
     }
 
+    if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
     updateJob(jobId, 95, '報告書を保存しています');
     const report = {
       id: randomUUID(),
@@ -528,11 +677,18 @@ async function generateReport(
       jobId,
       100,
       fallbackReason ? `イベントから報告書を生成しました: ${fallbackReason}` : `【${profile.name}】報告書の生成が完了しました（${provider.name}）`,
-      'completed'
+      'completed',
+      null
     );
   } catch (error: any) {
-    const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
-    updateJob(jobId, 0, `${error.message}${cause}`, 'failed');
+    if (error?.name === 'AbortError') {
+      updateJob(jobId, 0, '報告書の生成をキャンセルしました。', 'cancelled', null);
+    } else {
+      const cause = error?.cause ? ` (詳細: ${error.cause.message || error.cause.code || error.cause})` : '';
+      updateJob(jobId, 0, `${error.message}${cause}`, 'failed', null);
+    }
+  } finally {
+    jobAbortControllers.delete(jobId);
   }
 }
 
@@ -742,9 +898,15 @@ app.post('/api/videos/:id/analyze', (req, res) => {
     message: '解析を待機中',
     created_at: now(),
     updated_at: now(),
+    type: 'analyze',
+    state_json: null,
   };
-  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)').run(job.id, job.video_id, job.status, job.progress, job.message, job.created_at, job.updated_at);
-  void analyze(job.id, video, req.body);
+  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?)').run(
+    job.id, job.video_id, job.status, job.progress, job.message, job.created_at, job.updated_at, job.type, job.state_json
+  );
+  const abortController = new AbortController();
+  jobAbortControllers.set(job.id, abortController);
+  void analyze(job.id, video, req.body, abortController.signal);
   res.status(202).json(job);
 });
 
@@ -799,12 +961,120 @@ app.post('/api/videos/:id/report', (req, res) => {
     message: '報告書の生成を待機中',
     created_at: now(),
     updated_at: now(),
+    type: 'report',
+    state_json: null,
   };
-  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?)').run(job.id, job.video_id, job.status, job.progress, job.message, job.created_at, job.updated_at);
-  void generateReport(job.id, video, req.body);
+  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?)').run(
+    job.id, job.video_id, job.status, job.progress, job.message, job.created_at, job.updated_at, job.type, job.state_json
+  );
+  const abortController = new AbortController();
+  jobAbortControllers.set(job.id, abortController);
+  void generateReport(job.id, video, req.body, abortController.signal);
   res.status(202).json(job);
 });
 
+app.patch('/api/jobs/:id', (req, res) => {
+  const id = String(req.params.id);
+  const { status } = req.body;
+  if (!['cancelled', 'paused'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+
+  const existing = db.prepare('SELECT * FROM jobs WHERE id=?').get(id) as any;
+  if (!existing) return res.sendStatus(404);
+
+  // 報告書生成ジョブ（type === 'report'）の中断は不可（キャンセルのみ）
+  if (status === 'paused' && existing.type === 'report') {
+    return res.status(400).json({ error: '報告書生成は中断できません。キャンセルしてください。' });
+  }
+
+  if (!['queued', 'running'].includes(existing.status)) {
+    return res.status(409).json({ error: `ジョブはすでに ${existing.status} 状態です` });
+  }
+
+  // paused の場合は先に DB を更新してから abort（analyze の catch で isPaused を判定するため）
+  if (status === 'paused') {
+    db.prepare('UPDATE jobs SET status=?, updated_at=? WHERE id=?').run('paused', now(), id);
+  }
+
+  const abortController = jobAbortControllers.get(id);
+  if (abortController) {
+    abortController.abort();
+    jobAbortControllers.delete(id);
+  } else {
+    // AbortController が登録されていない場合の安全策
+    const msg = status === 'paused' ? '解析を中断しました。' : (existing.type === 'report' ? '報告書の生成をキャンセルしました。' : '解析をキャンセルしました。');
+    updateJob(id, 0, msg, status, null);
+  }
+
+  res.sendStatus(204);
+});
+
+// 中断した解析を再開するエンドポイント
+app.post('/api/jobs/:id/resume', (req, res) => {
+  const jobId = String(req.params.id);
+  const pausedJob = db.prepare('SELECT * FROM jobs WHERE id=?').get(jobId) as any;
+  if (!pausedJob) return res.sendStatus(404);
+  if (pausedJob.status !== 'paused') {
+    return res.status(409).json({ error: `ジョブは中断状態ではありません (status: ${pausedJob.status})` });
+  }
+
+  const video = db.prepare('SELECT * FROM videos WHERE id=?').get(pausedJob.video_id) as any;
+  if (!video) return res.sendStatus(404);
+
+  let state: any = null;
+  if (pausedJob.state_json) {
+    try {
+      state = JSON.parse(pausedJob.state_json);
+    } catch {}
+  }
+
+  // 新しいジョブを作成して再解析を開始
+  const newJob = {
+    id: randomUUID(),
+    video_id: pausedJob.video_id,
+    type: 'analyze',
+    status: 'queued',
+    progress: pausedJob.progress || 0,
+    message: '解析を再開しています...',
+    created_at: now(),
+    updated_at: now(),
+    state_json: pausedJob.state_json,
+  };
+  db.prepare('INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?)').run(
+    newJob.id,
+    newJob.video_id,
+    newJob.status,
+    newJob.progress,
+    newJob.message,
+    newJob.created_at,
+    newJob.updated_at,
+    newJob.type,
+    newJob.state_json
+  );
+
+  const abortController = new AbortController();
+  jobAbortControllers.set(newJob.id, abortController);
+
+  const options: AnalyzeOptions = {
+    providerId: req.body?.providerId || state?.providerId,
+    profileId: req.body?.profileId || state?.profileId,
+    customPerceptionPrompt: req.body?.customPerceptionPrompt || state?.customPerceptionPrompt,
+    mode: req.body?.mode || state?.mode,
+    resumeState: state?.files?.length ? {
+      completedBatches: state.completedBatches || 0,
+      events: state.events || [],
+      files: state.files,
+      interval: state.interval || 1,
+      duration: state.duration || 0,
+      totalBatches: state.totalBatches || 0,
+    } : undefined,
+  };
+
+  void analyze(newJob.id, video, options, abortController.signal);
+
+  res.status(202).json(newJob);
+});
+
+// 報告書取得エンドポイント
 app.get('/api/reports/:id', (req, res) => {
   const report = db.prepare('SELECT * FROM reports WHERE id=?').get(req.params.id);
   report ? res.json(report) : res.sendStatus(404);

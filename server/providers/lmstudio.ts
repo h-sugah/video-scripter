@@ -30,10 +30,13 @@ interface LMResponse {
   body: ReadableStream<Uint8Array> | null;
 }
 
-async function executeViaCurlExe(url: string, options: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<LMResponse> {
+async function executeViaCurlExe(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal } = {}): Promise<LMResponse> {
   const method = options.method || 'GET';
   const headers = options.headers || {};
   const body = options.body;
+  const signal = options.signal;
+
+  if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
 
   const args = ['-s', '-N', '-i', '-X', method];
   for (const [k, v] of Object.entries(headers)) {
@@ -45,6 +48,14 @@ async function executeViaCurlExe(url: string, options: { method?: string; header
   args.push(url);
 
   const proc = spawn('curl.exe', args);
+
+  if (signal) {
+    const onAbort = () => {
+      try { proc.kill(); } catch {}
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    proc.on('close', () => signal.removeEventListener('abort', onAbort));
+  }
 
   if (body !== undefined) {
     proc.stdin.write(body);
@@ -112,19 +123,24 @@ async function executeViaCurlExe(url: string, options: { method?: string; header
     proc.on('error', reject);
     proc.on('close', (code) => {
       if (!isHeaderDone) {
-        reject(new Error(`LM Studioへの接続に失敗しました (終了コード: ${code})`));
+        if (signal?.aborted) {
+          reject(new DOMException('中断されました', 'AbortError'));
+        } else {
+          reject(new Error(`LM Studioへの接続に失敗しました (終了コード: ${code})`));
+        }
       }
     });
   });
 }
 
-async function fetchLM(url: string, options: { method?: string; headers?: Record<string, string>; body?: string } = {}): Promise<LMResponse> {
+async function fetchLM(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal } = {}): Promise<LMResponse> {
   try {
     const res = await fetch(url, {
       method: options.method || 'GET',
       headers: options.headers,
       body: options.body,
       keepalive: true,
+      signal: options.signal,
     });
     return {
       ok: res.ok,
@@ -139,6 +155,9 @@ async function fetchLM(url: string, options: { method?: string; headers?: Record
       body: res.body,
     };
   } catch (err: any) {
+    if (options.signal?.aborted) {
+      throw new DOMException('中断されました', 'AbortError');
+    }
     // WSL環境下でWindowsホストの127.0.0.1上のLM Studioへ接続する場合、Node.js fetchはECONNREFUSEDとなるためcurl.exeへフォールバック
     if (canUseCurlExe()) {
       try {
@@ -191,7 +210,7 @@ export class LMStudioProvider implements AIProvider {
   }
 
   async analyzeVisionBatch(params: VisionBatchParams): Promise<string> {
-    const { config, prompt, batchFiles, folder, onProgress } = params;
+    const { config, prompt, batchFiles, folder, onProgress, signal } = params;
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     const model = config.model?.trim();
     if (!model) throw new Error('LM Studioのモデルが指定されていません');
@@ -237,6 +256,7 @@ export class LMStudioProvider implements AIProvider {
           method: 'POST',
           headers: this.getHeaders(config),
           body: JSON.stringify(attempt.body),
+          signal,
         });
 
         if (!res.ok) {
@@ -257,6 +277,10 @@ export class LMStudioProvider implements AIProvider {
         let tokenCount = 0;
 
         while (true) {
+          if (signal?.aborted) {
+            await reader.cancel();
+            throw new DOMException('中断されました', 'AbortError');
+          }
           const { done, value } = await reader.read();
           if (done) break;
 
@@ -307,7 +331,7 @@ export class LMStudioProvider implements AIProvider {
   }
 
   async generateText(params: TextGenerationParams): Promise<string> {
-    const { config, prompt, onProgress } = params;
+    const { config, prompt, onProgress, signal } = params;
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     const model = config.model?.trim();
     if (!model) throw new Error('LM Studioのモデルが指定されていません');
@@ -315,6 +339,7 @@ export class LMStudioProvider implements AIProvider {
     const res = await fetchLM(`${base}/chat/completions`, {
       method: 'POST',
       headers: this.getHeaders(config),
+      signal,
       body: JSON.stringify({
         model,
         temperature: 0.2,
@@ -339,6 +364,10 @@ export class LMStudioProvider implements AIProvider {
     let tokenCount = 0;
 
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('中断されました', 'AbortError');
+      }
       const { done, value } = await reader.read();
       if (done) break;
 

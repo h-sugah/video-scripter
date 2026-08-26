@@ -430,9 +430,14 @@ aside h3 {
 .job {
     background: #e9efff;
     border: 1px solid #cbd7ff;
-    padding: 13px 15px;
+    padding: 13px 16px;
     border-radius: 9px;
     margin-bottom: 20px;
+}
+
+.job.completed {
+    background: #f0fdf4;
+    border-color: #bbf7d0;
 }
 
 .job.failed {
@@ -440,17 +445,168 @@ aside h3 {
     border-color: #ffc9c5;
 }
 
-.job div:first-child {
+.job.paused {
+    background: #fffbeb;
+    border-color: #fde68a;
+}
+
+.job.cancelled {
+    background: #f1f5f9;
+    border-color: #cbd5e1;
+}
+
+.job-header {
     display: flex;
     justify-content: space-between;
-    gap: 15px;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.job-info {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+}
+
+.status-tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    background: #e0e7ff;
+    color: #3730a3;
+}
+
+.status-tag.status-completed {
+    background: #dcfce7;
+    color: #166534;
+}
+
+.status-tag.status-failed {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+.status-tag.status-paused {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+.status-tag.status-cancelled {
+    background: #e2e8f0;
+    color: #475569;
+}
+
+.job-message {
+    font-size: 13px;
+    color: #334155;
+    word-break: break-word;
+}
+
+.job-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+}
+
+.job-action-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 6px;
+}
+
+.job-action-btn.pause {
+    background: #fff;
+    border: 1px solid #f59e0b;
+    color: #d97706;
+}
+
+.job-action-btn.pause:hover {
+    background: #fef3c7;
+}
+
+.job-action-btn.cancel {
+    background: #fff;
+    border: 1px solid #cbd5e1;
+    color: #64748b;
+}
+
+.job-action-btn.cancel:hover {
+    background: #f8fafc;
+    border-color: #94a3b8;
+    color: #334155;
+}
+
+.job-action-btn.resume {
+    background: #2563eb;
+    border: 1px solid #2563eb;
+    color: #fff;
+}
+
+.job-action-btn.resume:hover {
+    background: #1d4ed8;
+}
+
+/* アクションバー内のボタン用スタイル */
+.pause-btn {
+    border-color: #f59e0b;
+    color: #b45309;
+    background: #fffbeb;
+    font-weight: 500;
+}
+
+.pause-btn:hover:not(:disabled) {
+    background: #fef3c7;
+    border-color: #d97706;
+}
+
+.cancel-btn {
+    border-color: #e2e8f0;
+    color: #64748b;
+    background: #fff;
+}
+
+.cancel-btn:hover:not(:disabled) {
+    background: #f1f5f9;
+    border-color: #cbd5e1;
+    color: #334155;
+}
+
+.resume-btn {
+    background: #16a34a;
+    border-color: #16a34a;
+    color: #fff;
+}
+
+.resume-btn:hover:not(:disabled) {
+    background: #15803d;
+    border-color: #15803d;
+}
+
+.secondary {
+    background: #f8fafc;
+    border-color: #cbd5e1;
+    color: #334155;
+}
+
+.secondary:hover:not(:disabled) {
+    background: #f1f5f9;
+    border-color: #94a3b8;
 }
 
 .progress {
-    height: 5px;
+    height: 6px;
     background: #d7deed;
     border-radius: 10px;
     margin-top: 10px;
+    overflow: hidden;
 }
 
 .progress i {
@@ -459,6 +615,22 @@ aside h3 {
     background: #3157d5;
     border-radius: 10px;
     transition: width 0.3s ease;
+}
+
+.job.paused .progress i {
+    background: #f59e0b;
+}
+
+.job.completed .progress i {
+    background: #22c55e;
+}
+
+.job.failed .progress i {
+    background: #ef4444;
+}
+
+.job.cancelled .progress i {
+    background: #94a3b8;
 }
 
 .work {
@@ -588,24 +760,100 @@ aside h3 {
 
 .reports {
     margin-top: 18px;
-    padding: 17px;
+    background: #fff;
+    border: 1px solid #e2e6ee;
+    border-radius: 11px;
 }
 
-.reports h2 {
-    margin-bottom: 12px;
+.reports-list {
+    padding: 12px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }
 
-.reports button {
-    display: block;
-    width: 100%;
-    text-align: left;
-    margin: 7px 0;
-    padding: 10px 14px;
+.report-item-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 12px 16px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #f8fafc;
+    cursor: pointer;
+    transition: all 0.15s ease;
 }
 
-.reports small {
-    float: right;
-    color: #7f8aa0;
+.report-item-card:hover {
+    border-color: #3157d5;
+    background: #f0f4ff;
+}
+
+.report-item-info {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 1;
+    min-width: 0;
+}
+
+.report-icon {
+    font-size: 20px;
+    flex-shrink: 0;
+}
+
+.report-item-texts {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+}
+
+.report-title {
+    font-size: 13.5px;
+    color: #1e293b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.report-date {
+    font-size: 11.5px;
+    color: #64748b;
+}
+
+.report-item-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.report-download-btn {
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 6px;
+    background: #fff;
+    border: 1px solid #cbd5e1;
+    color: #334155;
+    transition: all 0.15s ease;
+}
+
+.report-download-btn:hover {
+    background: #3157d5;
+    border-color: #3157d5;
+    color: #fff;
+}
+
+.report-preview-sheet {
+    max-width: 850px;
+}
+
+.report-markdown-view {
+    max-height: 60vh;
+    overflow-y: auto;
 }
 
 .toast {

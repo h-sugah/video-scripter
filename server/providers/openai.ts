@@ -50,7 +50,7 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async analyzeVisionBatch(params: VisionBatchParams): Promise<string> {
-    const { config, prompt, batchFiles, folder, onProgress } = params;
+    const { config, prompt, batchFiles, folder, onProgress, signal } = params;
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     const token = config.token?.trim();
     if (!token) throw new Error('OpenAI APIキーが設定されていません');
@@ -72,6 +72,7 @@ export class OpenAIProvider implements AIProvider {
       method: 'POST',
       headers: this.getHeaders(config),
       keepalive: true,
+      signal,
       body: JSON.stringify({
         model,
         temperature: 0.1,
@@ -95,6 +96,10 @@ export class OpenAIProvider implements AIProvider {
     let tokenCount = 0;
 
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('中断されました', 'AbortError');
+      }
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -128,7 +133,7 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async generateText(params: TextGenerationParams): Promise<string> {
-    const { config, prompt, onProgress } = params;
+    const { config, prompt, onProgress, signal } = params;
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     const token = config.token?.trim();
     if (!token) throw new Error('OpenAI APIキーが設定されていません');
@@ -138,6 +143,7 @@ export class OpenAIProvider implements AIProvider {
       method: 'POST',
       headers: this.getHeaders(config),
       keepalive: true,
+      signal,
       body: JSON.stringify({
         model,
         temperature: 0.2,
@@ -161,6 +167,10 @@ export class OpenAIProvider implements AIProvider {
     let tokenCount = 0;
 
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('中断されました', 'AbortError');
+      }
       const { done, value } = await reader.read();
       if (done) break;
 

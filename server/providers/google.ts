@@ -52,7 +52,7 @@ export class GoogleGeminiProvider implements AIProvider {
   }
 
   async analyzeVisionBatch(params: VisionBatchParams): Promise<string> {
-    const { config, prompt, batchFiles, folder, onProgress } = params;
+    const { config, prompt, batchFiles, folder, onProgress, signal } = params;
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     const token = config.token?.trim();
     if (!token) throw new Error('Google Gemini APIキーが設定されていません');
@@ -74,6 +74,7 @@ export class GoogleGeminiProvider implements AIProvider {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       keepalive: true,
+      signal,
       body: JSON.stringify({
         contents: [{ role: 'user', parts }],
         generationConfig: {
@@ -88,16 +89,17 @@ export class GoogleGeminiProvider implements AIProvider {
       throw new Error(`Gemini エラー (${res.status}): ${err.error?.message || res.statusText}`);
     }
 
-    return this.consumeGeminiStream(res, onProgress);
+    return this.consumeGeminiStream(res, onProgress, signal);
   }
 
   async analyzeVideoDirect(params: VideoDirectParams): Promise<string> {
-    const { config, prompt, videoPath, videoName, mimeType, onProgress } = params;
+    const { config, prompt, videoPath, videoName, mimeType, onProgress, signal } = params;
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     const token = config.token?.trim();
     if (!token) throw new Error('Google Gemini APIキーが設定されていません');
     const model = this.getCleanModel(config.model);
 
+    if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
     onProgress?.('Gemini File API に動画をアップロード中...');
     const fileStats = statSync(videoPath);
     const fileSize = fileStats.size;
@@ -113,6 +115,7 @@ export class GoogleGeminiProvider implements AIProvider {
         'X-Goog-Upload-Header-Content-Type': mimeType || 'video/mp4',
         'Content-Type': 'application/json',
       },
+      signal,
       body: JSON.stringify({
         file: {
           display_name: videoName,
@@ -139,6 +142,7 @@ export class GoogleGeminiProvider implements AIProvider {
         'X-Goog-Upload-Offset': '0',
         'X-Goog-Upload-Command': 'upload, finalize',
       },
+      signal,
       body: videoBuffer,
     });
 
@@ -161,9 +165,10 @@ export class GoogleGeminiProvider implements AIProvider {
       let state = fileResource.state;
       let attempts = 0;
       while (state === 'PROCESSING' && attempts < 60) {
+        if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
         onProgress?.(`Gemini側で動画を解析前処理中 (${attempts + 1}秒)...`);
         await new Promise(r => setTimeout(r, 2000));
-        const checkRes = await fetch(`${base}/v1beta/${fileName}?key=${encodeURIComponent(token)}`);
+        const checkRes = await fetch(`${base}/v1beta/${fileName}?key=${encodeURIComponent(token)}`, { signal });
         if (checkRes.ok) {
           const checkData = (await checkRes.json()) as any;
           state = checkData.state;
@@ -178,6 +183,7 @@ export class GoogleGeminiProvider implements AIProvider {
         throw new Error('Geminiでの動画前処理がタイムアウトしました');
       }
 
+      if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
       onProgress?.('Geminiで動画全体を直接解析中...');
 
       // 4. streamGenerateContent 呼び出し
@@ -186,6 +192,7 @@ export class GoogleGeminiProvider implements AIProvider {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         keepalive: true,
+        signal,
         body: JSON.stringify({
           contents: [
             {
@@ -213,9 +220,9 @@ export class GoogleGeminiProvider implements AIProvider {
         throw new Error(`Gemini 動画直接解析エラー (${generateRes.status}): ${err.error?.message || generateRes.statusText}`);
       }
 
-      return await this.consumeGeminiStream(generateRes, () => {});
+      return await this.consumeGeminiStream(generateRes, () => {}, signal);
     } finally {
-      // 5. 解析完了後にGemini上の一時ファイルをクリーンアップ
+      // 5. 解析完了後（またはエラー・中断時）にGemini上の一時ファイルをクリーンアップ
       try {
         await fetch(`${base}/v1beta/${fileName}?key=${encodeURIComponent(token)}`, {
           method: 'DELETE',
@@ -225,7 +232,7 @@ export class GoogleGeminiProvider implements AIProvider {
   }
 
   async generateText(params: TextGenerationParams): Promise<string> {
-    const { config, prompt, onProgress } = params;
+    const { config, prompt, onProgress, signal } = params;
     const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
     const token = config.token?.trim();
     if (!token) throw new Error('Google Gemini APIキーが設定されていません');
@@ -236,6 +243,7 @@ export class GoogleGeminiProvider implements AIProvider {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       keepalive: true,
+      signal,
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         generationConfig: {
@@ -250,10 +258,10 @@ export class GoogleGeminiProvider implements AIProvider {
       throw new Error(`Gemini エラー (${res.status}): ${err.error?.message || res.statusText}`);
     }
 
-    return this.consumeGeminiStream(res, onProgress);
+    return this.consumeGeminiStream(res, onProgress, signal);
   }
 
-  private async consumeGeminiStream(res: Response, onProgress?: (tokenCount: number) => void): Promise<string> {
+  private async consumeGeminiStream(res: Response, onProgress?: (tokenCount: number) => void, signal?: AbortSignal): Promise<string> {
     if (!res.body) throw new Error('Geminiからのレスポンスボディが空です');
 
     const reader = res.body.getReader();
@@ -263,6 +271,10 @@ export class GoogleGeminiProvider implements AIProvider {
     let tokenCount = 0;
 
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('中断されました', 'AbortError');
+      }
       const { done, value } = await reader.read();
       if (done) break;
 

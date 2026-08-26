@@ -90,6 +90,8 @@ function App() {
   const [job, setJob] = useState<any>();
   const [report, setReport] = useState<any>();
   const [showSettings, setShowSettings] = useState(false);
+  // 再開用に最後の解析オプションを保持
+  const [lastAnalyzeOptions, setLastAnalyzeOptions] = useState<any>(null);
 
   const activeStreamRef = useRef<EventSource | null>(null);
 
@@ -181,11 +183,14 @@ function App() {
       try {
         const next = JSON.parse(e.data);
         setJob(next);
-        if (['completed', 'failed'].includes(next.status)) {
+        if (['completed', 'failed', 'cancelled', 'paused'].includes(next.status)) {
           closeStream();
           if (next.status === 'completed') {
-            const isReportJob = typeof next.message === 'string' && (next.message.includes('報告書') || next.message.includes('記録') || next.message.includes('議事録'));
+            const isReportJob = next.type === 'report' || (typeof next.message === 'string' && (next.message.includes('報告書') || next.message.includes('記録') || next.message.includes('議事録')));
             openVideo(targetVideoId, isReportJob);
+          } else if (next.status === 'paused') {
+            // 中断時に抽出済みのイベントがあれば画面に反映
+            openVideo(targetVideoId);
           }
         }
       } catch {}
@@ -195,6 +200,56 @@ function App() {
       // 自動再接続待機
     };
   }, [closeStream, openVideo]);
+
+  const pauseJob = async () => {
+    if (!job?.id) return;
+    try {
+      setMessage('解析を中断しています...');
+      await api(`/jobs/${job.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'paused' }),
+      });
+    } catch (e: any) {
+      setMessage(e.message);
+    }
+  };
+
+  const cancelJob = async () => {
+    if (!job?.id) return;
+    const isReport = job?.type === 'report' || (typeof job?.message === 'string' && (job.message.includes('報告書') || job.message.includes('記録') || job.message.includes('議事録')));
+    try {
+      setMessage(isReport ? '報告書生成をキャンセルしています...' : '解析をキャンセルしています...');
+      await api(`/jobs/${job.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'cancelled' }),
+      });
+    } catch (e: any) {
+      setMessage(e.message);
+    }
+  };
+
+  const resumeJob = async () => {
+    if (!job?.id || !videoId) return;
+    try {
+      setMessage('解析を再開しています...');
+      const j = await api(`/jobs/${job.id}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerId: executionProvider,
+          profileId: executionProfile,
+          customPerceptionPrompt: executionProfile === 'custom' ? customPerceptionPrompt : undefined,
+          mode: videoAnalysisMode,
+        }),
+      });
+      setJob(j);
+      subscribeJob(j.id, videoId);
+    } catch (e: any) {
+      setMessage(e.message);
+    }
+  };
 
   const openProject = async (id: string) => {
     closeStream();
@@ -270,15 +325,51 @@ function App() {
     }
   };
 
-  const downloadReport = () => {
-    if (!report) return;
-    const safeName = String(report.title || '作業報告書').replace(/[\\/:*?"<>|]/g, '_');
-    const url = URL.createObjectURL(new Blob([report.markdown], { type: 'text/markdown;charset=utf-8' }));
+  const openReport = async (reportId: string) => {
+    try {
+      setMessage('報告書を読み込んでいます…');
+      const fullReport = await api('/reports/' + reportId);
+      setReport(fullReport);
+      setMessage('');
+    } catch (e: any) {
+      setMessage(`報告書の取得に失敗しました: ${e.message}`);
+    }
+  };
+
+  const downloadReport = (targetReport?: any) => {
+    const r = targetReport || report;
+    if (!r || !r.markdown) return;
+    const safeName = String(r.title || '作業報告書').replace(/[\\/:*?"<>|]/g, '_');
+    const url = URL.createObjectURL(new Blob([r.markdown], { type: 'text/markdown;charset=utf-8' }));
     const link = document.createElement('a');
     link.href = url;
     link.download = `${safeName}.md`;
+    document.body.appendChild(link);
     link.click();
+    document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    setMessage(`「${safeName}.md」をダウンロードしました。`);
+  };
+
+  const downloadReportById = async (e: React.MouseEvent, reportId: string) => {
+    e.stopPropagation();
+    try {
+      setMessage('報告書データを取得中…');
+      const fullReport = await api('/reports/' + reportId);
+      downloadReport(fullReport);
+    } catch (e: any) {
+      setMessage(`ダウンロードに失敗しました: ${e.message}`);
+    }
+  };
+
+  const copyReportToClipboard = async () => {
+    if (!report?.markdown) return;
+    try {
+      await navigator.clipboard.writeText(report.markdown);
+      setMessage('報告書のテキストをクリップボードにコピーしました。');
+    } catch {
+      setMessage('コピーに失敗しました。');
+    }
   };
 
   const testProviderConnection = async (providerId: string, silent = false) => {
@@ -367,6 +458,9 @@ function App() {
   };
 
   const isWorking = job?.status === 'running' || job?.status === 'queued';
+  const isPaused = job?.status === 'paused';
+  const isReportJob = job?.type === 'report' || (typeof job?.message === 'string' && (job.message.includes('報告書') || job.message.includes('記録') || job.message.includes('議事録')));
+  const isAnalyzeJob = !isReportJob;
   const activeProfileDef = profilesMeta.find(p => p.id === executionProfile) || profilesMeta[0];
   const activeProviderDef = providersMeta.find(p => p.id === executionProvider) || providersMeta[0];
 
@@ -493,9 +587,28 @@ function App() {
                   <p>動画ハッシュ: <code>{current?.sha256}</code></p>
                 </div>
                 <div className="actions">
-                  <button onClick={analyze} className="primary" disabled={isWorking}>✦ 解析開始</button>
-                  <button onClick={createReport} disabled={!events.length || isWorking}>報告書・記録を生成</button>
-                  <button className="delete" onClick={deleteVideo} disabled={isWorking}>削除</button>
+                  {isWorking ? (
+                    isAnalyzeJob ? (
+                      <>
+                        <button onClick={pauseJob} className="pause-btn" title="解析を一時中断します（後から続きを再開できます）">⏸ 中断</button>
+                        <button onClick={cancelJob} className="cancel-btn" title="解析を完全に中止します">⏹ キャンセル</button>
+                      </>
+                    ) : (
+                      <button onClick={cancelJob} className="cancel-btn" title="報告書生成を中止します">⏹ キャンセル</button>
+                    )
+                  ) : isPaused ? (
+                    <>
+                      <button onClick={resumeJob} className="primary resume-btn" title="中断した箇所から解析を再開します">▶ 解析を再開</button>
+                      <button onClick={analyze} className="secondary" title="最初から新しく解析を実行します">✦ 最初から再解析</button>
+                      <button onClick={cancelJob} className="cancel-btn" title="中断状態を破棄してキャンセルにします">⏹ キャンセル</button>
+                    </>
+                  ) : (
+                    <>
+                      <button onClick={analyze} className="primary">✦ 解析開始</button>
+                      <button onClick={createReport} disabled={!events.length}>報告書・記録を生成</button>
+                      <button className="delete" onClick={deleteVideo}>削除</button>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -578,9 +691,34 @@ function App() {
 
               {job && (
                 <div className={'job ' + job.status}>
-                  <div>
-                    <b>{job.status === 'completed' ? '完了' : job.status === 'failed' ? '失敗' : '処理中'}</b>
-                    <span>{job.message}</span>
+                  <div className="job-header">
+                    <div className="job-info">
+                      <b className={`status-tag status-${job.status}`}>
+                        {job.status === 'completed' ? '✓ 完了' :
+                         job.status === 'failed' ? '⚠ 失敗' :
+                         job.status === 'paused' ? '⏸ 中断中' :
+                         job.status === 'cancelled' ? '⏹ キャンセル' :
+                         isReportJob ? '📄 報告書生成中' : '🔍 解析中'}
+                      </b>
+                      <span className="job-message">{job.message}</span>
+                    </div>
+                    <div className="job-actions">
+                      {isWorking && isAnalyzeJob && (
+                        <>
+                          <button type="button" className="job-action-btn pause" onClick={pauseJob} title="解析を一時中断">⏸ 中断</button>
+                          <button type="button" className="job-action-btn cancel" onClick={cancelJob} title="解析を中止">⏹ キャンセル</button>
+                        </>
+                      )}
+                      {isWorking && isReportJob && (
+                        <button type="button" className="job-action-btn cancel" onClick={cancelJob} title="報告書生成を中止">⏹ キャンセル</button>
+                      )}
+                      {isPaused && (
+                        <>
+                          <button type="button" className="job-action-btn resume" onClick={resumeJob} title="中断した箇所から再開">▶ 解析を再開</button>
+                          <button type="button" className="job-action-btn cancel" onClick={cancelJob} title="中断状態を破棄">⏹ 破棄</button>
+                        </>
+                      )}
+                    </div>
                   </div>
                   <div className="progress">
                     <i style={{ width: `${job.progress}%` }} />
@@ -653,12 +791,33 @@ function App() {
 
               {reports.length > 0 && (
                 <div className="reports">
-                  <h2>生成された報告書・記録</h2>
-                  {reports.map(r => (
-                    <button key={r.id} onClick={async () => setReport(await api('/reports/' + r.id))}>
-                      📄 {r.title} <small>{new Date(r.created_at).toLocaleString()}</small>
-                    </button>
-                  ))}
+                  <div className="panel-head">
+                    <h2>生成された報告書・記録</h2>
+                    <span>{reports.length} 件</span>
+                  </div>
+                  <div className="reports-list">
+                    {reports.map(r => (
+                      <div key={r.id} className="report-item-card" onClick={() => openReport(r.id)} title="クリックして報告書をプレビュー">
+                        <div className="report-item-info">
+                          <span className="report-icon">📄</span>
+                          <div className="report-item-texts">
+                            <b className="report-title">{r.title}</b>
+                            <small className="report-date">{new Date(r.created_at).toLocaleString()}</small>
+                          </div>
+                        </div>
+                        <div className="report-item-actions">
+                          <button
+                            type="button"
+                            className="report-download-btn"
+                            onClick={(e) => downloadReportById(e, r.id)}
+                            title="Markdownファイルをダウンロード"
+                          >
+                            ↓ ダウンロード
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </>
@@ -670,14 +829,15 @@ function App() {
 
       {/* 報告書表示モーダル */}
       {report && (
-        <div className="modal">
-          <div className="sheet">
-            <button className="close" onClick={() => setReport(null)}>×</button>
+        <div className="modal" onClick={(e) => { if (e.target === e.currentTarget) setReport(null); }}>
+          <div className="sheet report-preview-sheet">
+            <button className="close" onClick={() => setReport(null)} title="閉じる">×</button>
             <h2>{report.title}</h2>
             <div className="modal-actions-bar">
-              <button className="primary download" onClick={downloadReport}>↓ Markdownをダウンロード</button>
+              <button className="primary download" onClick={() => downloadReport(report)}>↓ Markdownをダウンロード</button>
+              <button className="secondary copy" onClick={copyReportToClipboard}>📋 テキストをコピー</button>
             </div>
-            <pre>{report.markdown}</pre>
+            <pre className="report-markdown-view">{report.markdown}</pre>
           </div>
         </div>
       )}
