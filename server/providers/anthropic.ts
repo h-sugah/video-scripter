@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AIProvider, ProviderConfig, VisionBatchParams, TextGenerationParams } from './types.js';
+import { validateProviderUrl } from './validator.js';
+import { createFetchTimeout, combineSignals, CONNECT_TEST_TIMEOUT_MS, RESPONSE_START_TIMEOUT_MS } from './utils.js';
 
 export class AnthropicProvider implements AIProvider {
   readonly id = 'anthropic' as const;
@@ -19,6 +21,15 @@ export class AnthropicProvider implements AIProvider {
     'claude-fable-5',
   ];
 
+  private getValidatedBaseUrl(baseUrl?: string): string {
+    const raw = baseUrl || this.defaultBaseUrl;
+    const val = validateProviderUrl('anthropic', raw);
+    if (!val.valid || !val.normalizedUrl) {
+      throw new Error(`Anthropic URL検証エラー: ${val.error}`);
+    }
+    return val.normalizedUrl;
+  }
+
   private getHeaders(config: ProviderConfig): Record<string, string> {
     const token = config.token?.trim() || '';
     return {
@@ -29,15 +40,23 @@ export class AnthropicProvider implements AIProvider {
   }
 
   async testConnection(config: ProviderConfig): Promise<{ models: string[] }> {
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('Anthropic APIキーを入力してください');
 
     try {
-      const res = await fetch(`${base}/models`, {
-        headers: this.getHeaders(config),
-        keepalive: true,
-      });
+      const fetchTimeout = createFetchTimeout(CONNECT_TEST_TIMEOUT_MS);
+      let res: Response;
+      try {
+        res = await fetch(`${base}/models`, {
+          headers: this.getHeaders(config),
+          keepalive: true,
+          redirect: 'error',
+          signal: fetchTimeout.signal,
+        });
+      } finally {
+        fetchTimeout.clear();
+      }
 
       if (res.ok) {
         const data = (await res.json()) as any;
@@ -47,15 +66,23 @@ export class AnthropicProvider implements AIProvider {
     } catch {}
 
     // /models が利用できない場合の簡易検証
-    const res = await fetch(`${base}/messages`, {
-      method: 'POST',
-      headers: this.getHeaders(config),
-      body: JSON.stringify({
-        model: config.model?.trim() || this.defaultModel,
-        max_tokens: 1,
-        messages: [{ role: 'user', content: 'hi' }],
-      }),
-    });
+    const fetchTimeout = createFetchTimeout(CONNECT_TEST_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/messages`, {
+        method: 'POST',
+        headers: this.getHeaders(config),
+        redirect: 'error',
+        signal: fetchTimeout.signal,
+        body: JSON.stringify({
+          model: config.model?.trim() || this.defaultModel,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -67,7 +94,7 @@ export class AnthropicProvider implements AIProvider {
 
   async analyzeVisionBatch(params: VisionBatchParams): Promise<string> {
     const { config, prompt, batchFiles, folder, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('Anthropic APIキーが設定されていません');
     const model = config.model?.trim() || this.defaultModel;
@@ -86,19 +113,26 @@ export class AnthropicProvider implements AIProvider {
     }
     content.push({ type: 'text', text: prompt });
 
-    const res = await fetch(`${base}/messages`, {
-      method: 'POST',
-      headers: this.getHeaders(config),
-      keepalive: true,
-      signal,
-      body: JSON.stringify({
-        model,
-        max_tokens: 4096,
-        temperature: 0.1,
-        stream: true,
-        messages: [{ role: 'user', content }],
-      }),
-    });
+    const fetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/messages`, {
+        method: 'POST',
+        headers: this.getHeaders(config),
+        keepalive: true,
+        redirect: 'error',
+        signal: combineSignals(signal, fetchTimeout.signal),
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          temperature: 0.1,
+          stream: true,
+          messages: [{ role: 'user', content }],
+        }),
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -150,24 +184,31 @@ export class AnthropicProvider implements AIProvider {
 
   async generateText(params: TextGenerationParams): Promise<string> {
     const { config, prompt, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('Anthropic APIキーが設定されていません');
     const model = config.model?.trim() || this.defaultModel;
 
-    const res = await fetch(`${base}/messages`, {
-      method: 'POST',
-      headers: this.getHeaders(config),
-      keepalive: true,
-      signal,
-      body: JSON.stringify({
-        model,
-        max_tokens: 4096,
-        temperature: 0.2,
-        stream: true,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
+    const fetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/messages`, {
+        method: 'POST',
+        headers: this.getHeaders(config),
+        keepalive: true,
+        redirect: 'error',
+        signal: combineSignals(signal, fetchTimeout.signal),
+        body: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          temperature: 0.2,
+          stream: true,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));

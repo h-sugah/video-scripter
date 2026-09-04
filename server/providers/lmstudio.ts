@@ -3,7 +3,16 @@ import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { Readable, PassThrough } from 'node:stream';
 import type { AIProvider, ProviderConfig, VisionBatchParams, TextGenerationParams } from './types.js';
-import { cleanModelText } from './utils.js';
+import { cleanModelText, createFetchTimeout, combineSignals, CONNECT_TEST_TIMEOUT_MS, RESPONSE_START_TIMEOUT_MS } from './utils.js';
+import { validateProviderUrl } from './validator.js';
+
+// LM Studioはユーザーのローカル環境(消費者向けGPU/CPU)でモデルを動かすため、大型モデル
+// (例: Qwen3.8-27B)では画像を含むプロンプトのprefillに時間がかかり、最初のトークンが
+// 返るまでの時間がクラウドAPIより大幅に長くなることがある。共通のRESPONSE_START_TIMEOUT_MS
+// (30秒)は元より、その3倍(90秒)でも実際にタイムアウトする事例が確認されたため、
+// 実測に基づき5分(300秒)まで引き上げる。接続テスト(testConnection)は/modelsを
+// 呼ぶだけで生成を伴わないため、CONNECT_TEST_TIMEOUT_MSのまま変更しない。
+export const LMSTUDIO_RESPONSE_START_TIMEOUT_MS = 300_000;
 
 let hasCheckedCurlExe: boolean | null = null;
 function canUseCurlExe(): boolean {
@@ -38,14 +47,23 @@ async function executeViaCurlExe(url: string, options: { method?: string; header
 
   if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
 
-  const args = ['-s', '-N', '-i', '-X', method];
+  // SSRF対策: プロトコルを http,https のみに限定し、リダイレクト追従を無効化
+  //
+  // 既知の残存リスク: Authorizationヘッダー(LM Studioトークン設定時)をcurl.exeの
+  // コマンドライン引数(-H)として渡しているため、同一Windowsホスト上の他プロセス/他ユーザーが
+  // タスクマネージャー等でコマンドライン全体を閲覧できた場合、トークンが露出し得る(WSL環境限定)。
+  // 対策として「-K <設定ファイル>」でヘッダーをargv外に逃がす方式を検討したが、
+  // WSL側で生成した一時ファイルのパス(/tmp/...)はWindowsネイティブバイナリのcurl.exeから
+  // そのままでは読めず(WSLNIC/UNCパス変換が必要)、この環境では動作を検証できなかったため見送った。
+  // WSL環境で実際に動作確認できる場合は、設定ファイル経由への変更を検討すること。
+  const args = ['-s', '-N', '-i', '--proto', '=http,https', '--max-redirs', '0', '-X', method];
   for (const [k, v] of Object.entries(headers)) {
     args.push('-H', `${k}: ${v}`);
   }
   if (body !== undefined) {
     args.push('--data-binary', '@-');
   }
-  args.push(url);
+  args.push('--', url);
 
   const proc = spawn('curl.exe', args);
 
@@ -133,14 +151,19 @@ async function executeViaCurlExe(url: string, options: { method?: string; header
   });
 }
 
-async function fetchLM(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal } = {}): Promise<LMResponse> {
+async function fetchLM(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<LMResponse> {
+  // LM Studioが無応答のまま無期限にハングしないよう、応答開始(ヘッダー受信)までにタイムアウトを設ける。
+  // ヘッダー受信後(=fetchLMが返った後)のストリーム読み取りはユーザーのキャンセルsignalのみで制御する。
+  const fetchTimeout = createFetchTimeout(options.timeoutMs ?? RESPONSE_START_TIMEOUT_MS);
+  const combinedSignal = combineSignals(options.signal, fetchTimeout.signal);
   try {
     const res = await fetch(url, {
       method: options.method || 'GET',
       headers: options.headers,
       body: options.body,
       keepalive: true,
-      signal: options.signal,
+      redirect: 'error',
+      signal: combinedSignal,
     });
     return {
       ok: res.ok,
@@ -158,15 +181,23 @@ async function fetchLM(url: string, options: { method?: string; headers?: Record
     if (options.signal?.aborted) {
       throw new DOMException('中断されました', 'AbortError');
     }
+    if (fetchTimeout.signal.aborted) {
+      throw new Error(`LM Studioへの接続がタイムアウトしました。LM StudioでLocal Serverが起動しているか確認してください。`);
+    }
     // WSL環境下でWindowsホストの127.0.0.1上のLM Studioへ接続する場合、Node.js fetchはECONNREFUSEDとなるためcurl.exeへフォールバック
     if (canUseCurlExe()) {
       try {
-        return await executeViaCurlExe(url, options);
+        return await executeViaCurlExe(url, { ...options, signal: combinedSignal });
       } catch (curlErr: any) {
+        if (fetchTimeout.signal.aborted) {
+          throw new Error('LM Studioへの接続がタイムアウトしました。LM StudioでLocal Serverが起動しているか確認してください。');
+        }
         throw new Error(`LM Studio接続エラー: ${curlErr.message || err.message} (LM Studioが起動していること、およびLocal Serverが開始されていることを確認してください)`);
       }
     }
     throw new Error(`LM Studio接続エラー: ${err.message} (127.0.0.1:1234 に接続できません。LM StudioでLocal Serverが起動しているか確認してください)`);
+  } finally {
+    fetchTimeout.clear();
   }
 }
 
@@ -186,6 +217,15 @@ export class LMStudioProvider implements AIProvider {
     'qwen3.5-9b',
   ];
 
+  private getValidatedBaseUrl(baseUrl?: string): string {
+    const raw = baseUrl || this.defaultBaseUrl;
+    const val = validateProviderUrl('lmstudio', raw);
+    if (!val.valid || !val.normalizedUrl) {
+      throw new Error(`LM Studio URL検証エラー: ${val.error}`);
+    }
+    return val.normalizedUrl;
+  }
+
   private getHeaders(config: ProviderConfig): Record<string, string> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const token = config.token?.trim();
@@ -196,9 +236,10 @@ export class LMStudioProvider implements AIProvider {
   }
 
   async testConnection(config: ProviderConfig): Promise<{ models: string[] }> {
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const res = await fetchLM(`${base}/models`, {
       headers: this.getHeaders(config),
+      timeoutMs: CONNECT_TEST_TIMEOUT_MS,
     });
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
@@ -211,7 +252,7 @@ export class LMStudioProvider implements AIProvider {
 
   async analyzeVisionBatch(params: VisionBatchParams): Promise<string> {
     const { config, prompt, batchFiles, folder, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const model = config.model?.trim();
     if (!model) throw new Error('LM Studioのモデルが指定されていません');
 
@@ -224,31 +265,71 @@ export class LMStudioProvider implements AIProvider {
       });
     }
 
+    // VISION_MAX_TOKENS: 4096だと、饒舌なモデル(例: Gemma-4-12B)が4枚分のイベントを
+    // 説明する過程でJSON出力の途中(閉じ括弧の前)に達してしまい、不完全なJSONとなって
+    // 後段のparseModelJsonが解析に失敗するケースが確認された。8192へ引き上げて余裕を持たせる。
+    const VISION_MAX_TOKENS = 8192;
     const attempts: { name: string; body: any }[] = [
       {
         name: 'stream_plain',
         body: {
           model,
           temperature: 0.1,
-          max_tokens: 4096,
+          max_tokens: VISION_MAX_TOKENS,
           stream: true,
           messages: [{ role: 'user', content }],
         },
       },
       {
-        name: 'stream_json',
+        // 注意: response_format.typeに'json_object'を指定すると、LM Studioのバックエンドに
+        // よっては「'response_format.type' must be 'json_schema' or 'text'」という
+        // HTTP 400で拒否される(例: Qwen3.8-27B)。OpenAI互換APIの新しいstructured outputs
+        // 仕様に厳密に従うバックエンド向けに、'json_schema'を使う。strict:falseとして
+        // JSON Schemaはあくまで「ガイド」として扱わせ、バックエンドによる厳格な
+        // additionalProperties/required制約での追加拒否を避ける。
+        name: 'stream_json_schema',
         body: {
           model,
           temperature: 0.1,
-          max_tokens: 4096,
+          max_tokens: VISION_MAX_TOKENS,
           stream: true,
-          response_format: { type: 'json_object' },
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'video_events',
+              strict: false,
+              schema: {
+                type: 'object',
+                properties: {
+                  events: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        start_time: { type: 'number' },
+                        end_time: { type: ['number', 'null'] },
+                        event_type: { type: 'string' },
+                        description: { type: 'string' },
+                        objects: { type: 'array', items: { type: 'string' } },
+                        confidence: { type: 'number' },
+                        frame_index: { type: 'integer' },
+                      },
+                      required: ['start_time', 'description'],
+                    },
+                  },
+                },
+                required: ['events'],
+              },
+            },
+          },
           messages: [{ role: 'user', content }],
         },
       },
     ];
 
-    let lastError: any = null;
+    // 各試行(attempt)の失敗理由をすべて保持する。最後の試行の失敗理由だけを見せると、
+    // 実際に原因を特定すべき最初の試行のエラーが握りつぶされてしまうため。
+    const attemptErrors: string[] = [];
 
     for (const attempt of attempts) {
       try {
@@ -257,11 +338,12 @@ export class LMStudioProvider implements AIProvider {
           headers: this.getHeaders(config),
           body: JSON.stringify(attempt.body),
           signal,
+          timeoutMs: LMSTUDIO_RESPONSE_START_TIMEOUT_MS,
         });
 
         if (!res.ok) {
           const errorText = await res.text().catch(() => '');
-          lastError = new Error(`HTTP ${res.status}: ${errorText}`);
+          attemptErrors.push(`[${attempt.name}] HTTP ${res.status}: ${errorText}`);
           continue;
         }
 
@@ -275,6 +357,7 @@ export class LMStudioProvider implements AIProvider {
         let accumulatedContent = '';
         let accumulatedReasoning = '';
         let tokenCount = 0;
+        let finishReason = '';
 
         while (true) {
           if (signal?.aborted) {
@@ -295,7 +378,9 @@ export class LMStudioProvider implements AIProvider {
             if (trimmed.startsWith('data: ')) {
               try {
                 const data = JSON.parse(trimmed.slice(6));
-                const delta = data.choices?.[0]?.delta;
+                const choice = data.choices?.[0];
+                if (choice?.finish_reason) finishReason = choice.finish_reason;
+                const delta = choice?.delta;
                 if (delta) {
                   if (typeof delta.content === 'string') {
                     accumulatedContent += delta.content;
@@ -314,36 +399,49 @@ export class LMStudioProvider implements AIProvider {
           }
         }
 
+        // finish_reason:'length' は max_tokens 上限に達して応答が途中で打ち切られたことを示す。
+        // この場合、たとえテキストが取得できていてもJSONとして不完全な可能性が高いため、
+        // 「JSON抽出失敗」という分かりにくい下流エラーに落とさず、ここで原因を明示して
+        // 次の試行へ進む(いずれの試行も同じ上限のため、最終的にはこの明確な理由で失敗を報告する)。
+        if (finishReason === 'length') {
+          attemptErrors.push(
+            `[${attempt.name}] 応答がトークン上限(max_tokens=${VISION_MAX_TOKENS})に達し、出力が途中で切れました。1バッチのフレーム枚数を減らすか、より簡潔な出力をするモデルの利用を検討してください。`
+          );
+          continue;
+        }
+
         const finalText = accumulatedContent.trim() || accumulatedReasoning.trim();
         if (finalText) {
           return finalText;
         }
 
-        lastError = new Error('ストリームから有効なテキストを受信できませんでした');
+        attemptErrors.push(`[${attempt.name}] ストリームから有効なテキストを受信できませんでした`);
       } catch (err: any) {
-        lastError = err;
+        if (err?.name === 'AbortError') throw err;
+        const causeDetail = err?.cause?.message || err?.cause?.code || '';
+        attemptErrors.push(`[${attempt.name}] ${err?.message || String(err)}${causeDetail ? ` (${causeDetail})` : ''}`);
       }
     }
 
-    const causeDetail = lastError?.cause?.message || lastError?.cause?.code || '';
-    const detail = causeDetail ? ` (${causeDetail})` : '';
-    throw new Error(`${lastError?.message || 'LM Studioへの接続に失敗しました'}${detail}`);
+    throw new Error(`LM Studioでの解析に失敗しました: ${attemptErrors.join(' / ') || '不明なエラー'}`);
   }
 
   async generateText(params: TextGenerationParams): Promise<string> {
     const { config, prompt, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const model = config.model?.trim();
     if (!model) throw new Error('LM Studioのモデルが指定されていません');
 
+    const REPORT_MAX_TOKENS = 8192;
     const res = await fetchLM(`${base}/chat/completions`, {
       method: 'POST',
       headers: this.getHeaders(config),
       signal,
+      timeoutMs: LMSTUDIO_RESPONSE_START_TIMEOUT_MS,
       body: JSON.stringify({
         model,
         temperature: 0.2,
-        max_tokens: 4096,
+        max_tokens: REPORT_MAX_TOKENS,
         stream: true,
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -362,6 +460,7 @@ export class LMStudioProvider implements AIProvider {
     let accumulatedContent = '';
     let accumulatedReasoning = '';
     let tokenCount = 0;
+    let finishReason = '';
 
     while (true) {
       if (signal?.aborted) {
@@ -382,7 +481,9 @@ export class LMStudioProvider implements AIProvider {
         if (trimmed.startsWith('data: ')) {
           try {
             const data = JSON.parse(trimmed.slice(6));
-            const delta = data.choices?.[0]?.delta;
+            const choice = data.choices?.[0];
+            if (choice?.finish_reason) finishReason = choice.finish_reason;
+            const delta = choice?.delta;
             if (delta) {
               if (typeof delta.content === 'string') {
                 accumulatedContent += delta.content;
@@ -399,6 +500,10 @@ export class LMStudioProvider implements AIProvider {
           } catch {}
         }
       }
+    }
+
+    if (finishReason === 'length') {
+      throw new Error(`応答がトークン上限(max_tokens=${REPORT_MAX_TOKENS})に達し、報告書の生成が途中で切れました。観測イベント数を絞るか、より簡潔な出力をするモデルの利用を検討してください。`);
     }
 
     const finalText = accumulatedContent.trim() || accumulatedReasoning.trim();

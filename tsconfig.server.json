@@ -1,5 +1,6 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "module": "NodeNext", "moduleResolution": "NodeNext", "outDir": "dist-server", "noEmit": false, "rootDir": "server" },
-  "include": ["server"]
+  "include": ["server"],
+  "exclude": ["server/**/*.test.ts"]
 }

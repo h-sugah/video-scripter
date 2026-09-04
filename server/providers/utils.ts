@@ -1,3 +1,25 @@
+// 外部AIプロバイダーへのfetchに接続/応答待ちタイムアウトを追加するためのヘルパー。
+// ヘッダー受信(fetchの解決)までのみを対象とし、それ以降のストリーム読み取りは対象外とする
+// (ユーザーによるジョブキャンセル用signalのみで制御を続ける)。
+// これにより「プロバイダーが無応答のまま無期限にハングする」ケースを防ぎつつ、
+// 正当に長時間かかるストリーミング生成そのものは妨げない。
+export function createFetchTimeout(timeoutMs: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException('接続がタイムアウトしました', 'TimeoutError')), timeoutMs);
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
+}
+
+// ユーザーのキャンセル用signal(任意)とタイムアウト用signalを合成する。
+// どちらか一方でも発火すればfetchが中断される。
+export function combineSignals(userSignal: AbortSignal | undefined, timeoutSignal: AbortSignal): AbortSignal {
+  return userSignal ? AbortSignal.any([userSignal, timeoutSignal]) : timeoutSignal;
+}
+
+// 接続テスト(testConnection)用の短いタイムアウト
+export const CONNECT_TEST_TIMEOUT_MS = 20_000;
+// 生成系リクエストの応答開始(ヘッダー受信)待ちタイムアウト
+export const RESPONSE_START_TIMEOUT_MS = 30_000;
+
 // 思考モデル（Thinking/Reasoning model）の <think> タグや前後の余計なテキストをクリーンアップ
 export function cleanModelText(text: string): string {
   if (!text) return '';

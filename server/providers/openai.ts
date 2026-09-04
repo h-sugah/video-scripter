@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AIProvider, ProviderConfig, VisionBatchParams, TextGenerationParams } from './types.js';
+import { validateProviderUrl } from './validator.js';
+import { createFetchTimeout, combineSignals, CONNECT_TEST_TIMEOUT_MS, RESPONSE_START_TIMEOUT_MS } from './utils.js';
 
 export class OpenAIProvider implements AIProvider {
   readonly id = 'openai' as const;
@@ -19,6 +21,15 @@ export class OpenAIProvider implements AIProvider {
     'gpt-5.6-terra',
   ];
 
+  private getValidatedBaseUrl(baseUrl?: string): string {
+    const raw = baseUrl || this.defaultBaseUrl;
+    const val = validateProviderUrl('openai', raw);
+    if (!val.valid || !val.normalizedUrl) {
+      throw new Error(`OpenAI URL検証エラー: ${val.error}`);
+    }
+    return val.normalizedUrl;
+  }
+
   private getHeaders(config: ProviderConfig): Record<string, string> {
     const token = config.token?.trim() || '';
     return {
@@ -28,14 +39,22 @@ export class OpenAIProvider implements AIProvider {
   }
 
   async testConnection(config: ProviderConfig): Promise<{ models: string[] }> {
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('OpenAI APIキーを入力してください');
 
-    const res = await fetch(`${base}/models`, {
-      headers: this.getHeaders(config),
-      keepalive: true,
-    });
+    const fetchTimeout = createFetchTimeout(CONNECT_TEST_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/models`, {
+        headers: this.getHeaders(config),
+        keepalive: true,
+        redirect: 'error',
+        signal: fetchTimeout.signal,
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -51,7 +70,7 @@ export class OpenAIProvider implements AIProvider {
 
   async analyzeVisionBatch(params: VisionBatchParams): Promise<string> {
     const { config, prompt, batchFiles, folder, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('OpenAI APIキーが設定されていません');
     const model = config.model?.trim() || this.defaultModel;
@@ -68,19 +87,26 @@ export class OpenAIProvider implements AIProvider {
       });
     }
 
-    const res = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: this.getHeaders(config),
-      keepalive: true,
-      signal,
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        max_tokens: 4096,
-        stream: true,
-        messages: [{ role: 'user', content }],
-      }),
-    });
+    const fetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: this.getHeaders(config),
+        keepalive: true,
+        redirect: 'error',
+        signal: combineSignals(signal, fetchTimeout.signal),
+        body: JSON.stringify({
+          model,
+          temperature: 0.1,
+          max_tokens: 4096,
+          stream: true,
+          messages: [{ role: 'user', content }],
+        }),
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -134,24 +160,31 @@ export class OpenAIProvider implements AIProvider {
 
   async generateText(params: TextGenerationParams): Promise<string> {
     const { config, prompt, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('OpenAI APIキーが設定されていません');
     const model = config.model?.trim() || this.defaultModel;
 
-    const res = await fetch(`${base}/chat/completions`, {
-      method: 'POST',
-      headers: this.getHeaders(config),
-      keepalive: true,
-      signal,
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        max_tokens: 4096,
-        stream: true,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
+    const fetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: this.getHeaders(config),
+        keepalive: true,
+        redirect: 'error',
+        signal: combineSignals(signal, fetchTimeout.signal),
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          max_tokens: 4096,
+          stream: true,
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));

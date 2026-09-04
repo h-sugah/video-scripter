@@ -6,6 +6,7 @@ import { GoogleGeminiProvider } from './google.js';
 
 export * from './types.js';
 export * from './utils.js';
+export * from './validator.js';
 
 const providers: Record<ProviderId, AIProvider> = {
   lmstudio: new LMStudioProvider(),
