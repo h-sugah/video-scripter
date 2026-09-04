@@ -2,7 +2,8 @@ import express from 'express';
 import multer from 'multer';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, renameSync, readFileSync, rmSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, rmSync, readdirSync, createReadStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import { join, extname, basename } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +15,7 @@ import {
   cleanModelText,
   parseModelJson,
   normalizeEvents,
+  validateProviderUrl,
   type ProviderId,
   type ProviderConfig,
 } from './providers/index.js';
@@ -27,13 +29,32 @@ import {
   type ProfileId,
 } from './profiles/index.js';
 
+import { videoFileFilter, validateUploadedVideo, VideoValidationError } from './videoValidation.js';
+import { loopbackGuard } from './loopbackGuard.js';
+import { csrfGuard, createRequireAuth, createLoginHandler, logoutHandler, ensureLanAuthToken } from './auth.js';
+import { hardenPermissions, DIR_MODE, FILE_MODE } from './filePermissions.js';
+import { securityHeaders } from './securityHeaders.js';
+import { initSecretStore, describeSecretSource, encryptSecret, decryptSecret, isEncryptedFormat } from './secretStore.js';
+
 const root = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const data = join(root, 'data');
 const uploads = join(data, 'uploads');
 const framesRoot = join(data, 'frames');
-for (const path of [data, uploads, framesRoot]) mkdirSync(path, { recursive: true });
+const incoming = join(data, 'incoming');
 
-const db = new DatabaseSync(join(data, 'video-scripter.sqlite'));
+// サーバーの絶対パス(OSユーザー名やディレクトリ構造)がクライアント向けエラーメッセージに
+// 含まれないよう除去する。ffprobe/ffmpegのstderr等、外部コマンドの出力にも適用する。
+// 除去前の詳細はサーバーのコンソールログにのみ出力する。
+function redactAbsolutePaths(text: string): string {
+  if (!text) return text;
+  return text.split(root).join('<app>');
+}
+for (const path of [data, uploads, framesRoot, incoming]) mkdirSync(path, { recursive: true });
+// 同一マシンの他OSユーザーからdata配下(動画・フレーム画像・DB)を読めないよう権限を締める(多層防御)。
+hardenPermissions([data, uploads, framesRoot, incoming], DIR_MODE);
+
+const dbPath = join(data, 'video-scripter.sqlite');
+const db = new DatabaseSync(dbPath);
 db.exec(`PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS videos (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, duration REAL, created_at TEXT NOT NULL);
@@ -93,22 +114,111 @@ if (!getSetting('anthropic_model')) setSetting('anthropic_model', '');
 if (!getSetting('google_url')) setSetting('google_url', 'https://generativelanguage.googleapis.com');
 if (!getSetting('google_model')) setSetting('google_model', '');
 
+// APIキー等の秘密情報を含むSQLite本体・WAL/SHM補助ファイルを所有者のみ読めるようにする(多層防御)。
+// WALモードのため、この時点までの書き込みでwal/shmファイルが生成されているはず。
+hardenPermissions([dbPath, `${dbPath}-wal`, `${dbPath}-shm`], FILE_MODE);
+
+// APIキー暗号化用マスターキーの初期化(可能な限りOSの資格情報ストアに保護させる)。
+// ファイルパーミッションに加え、DBファイル単体が漏れてもAPIキーを復元できないようにする。
+const secretStoreInfo = await initSecretStore(data);
+console.log(`APIキー等の秘密情報は ${describeSecretSource(secretStoreInfo.source)} で保護されたマスターキーにより暗号化されます。`);
+
+// 本モジュール導入以前に平文で保存されていたAPIトークンを、起動時に一度だけ暗号化形式へ移行する。
+for (const p of getAllProviders()) {
+  const raw = getSetting(`${p.id}_token`, '');
+  if (raw && !isEncryptedFormat(raw)) {
+    setSetting(`${p.id}_token`, encryptSecret(raw));
+    console.log(`${p.name} のAPIトークンを暗号化形式へ移行しました。`);
+  }
+}
+
+// APIトークンの読み書きは必ずこの2関数を経由し、DBには常に暗号化形式でのみ保存する。
+function getProviderToken(providerId: ProviderId): string {
+  const raw = getSetting(`${providerId}_token`, '');
+  if (!raw) return '';
+  try {
+    return decryptSecret(raw);
+  } catch (e) {
+    console.warn(`APIトークンの復号に失敗しました (provider=${providerId}):`, e);
+    return '';
+  }
+}
+
+function setProviderToken(providerId: ProviderId, token: string): void {
+  setSetting(`${providerId}_token`, token ? encryptSecret(token) : '');
+}
+
 function getProviderConfig(providerId: ProviderId): ProviderConfig {
   const provider = getProvider(providerId);
   return {
     id: providerId,
     name: provider.name,
     baseUrl: getSetting(`${providerId}_url`, provider.defaultBaseUrl),
-    token: getSetting(`${providerId}_token`, ''),
+    token: getProviderToken(providerId),
     model: getSetting(`${providerId}_model`, provider.defaultModel),
   };
 }
 
-const app = express();
-app.use(express.json({ limit: '4mb' }));
-app.use('/media', express.static(data));
+const host = process.env.HOST || '127.0.0.1';
+const port = Number(process.env.PORT || 5173);
+// HOSTが明示的にループバック以外へ設定された場合のみLANモードを有効化する。
+// LANモードでは認証(トークン/セッション)が必須になり、非ループバック接続はloopbackGuardで
+// 一律拒否する代わりに、Origin検証・CSRF対策・認証チェックのチェーンに委ねる。
+const lanMode = !['127.0.0.1', 'localhost', '::1'].includes(host);
 
-const upload = multer({ dest: join(data, 'incoming'), limits: { fileSize: 10 * 1024 * 1024 * 1024 } });
+const app = express();
+// CSP等のセキュリティヘッダーを全レスポンスに付与する。最初期に登録し、
+// エラーハンドラーが返すレスポンスも含め、あらゆるレスポンスに確実に適用されるようにする。
+app.use(securityHeaders);
+if (lanMode) {
+  console.log('='.repeat(60));
+  console.log('⚠ LAN公開モードで起動します（HOSTがループバック以外に設定されています）');
+} else {
+  // 多層防御: HOSTのバインド設定に加え、アプリ層でも接続元がループバックであることを確認する。
+  // 最初のミドルウェアとして登録し、静的アセット・SPA配信を含む全ルートを保護対象にする。
+  app.use(loopbackGuard);
+}
+// Origin検証 + CSRF対策ヘッダー検証。ループバック/LAN問わず常時適用する。
+// loopbackGuard単体では防げないDNSリバインディング攻撃(悪意あるサイトのオリジンを
+// 127.0.0.1へ解決させ、正規のTCP接続に見せかけてAPIを叩く手口)への対策を兼ねる。
+app.use(csrfGuard);
+
+let lanAuthToken = '';
+if (lanMode) {
+  lanAuthToken = ensureLanAuthToken(data);
+  console.log(`アクセストークン: ${lanAuthToken}`);
+  console.log('このトークンは data/lan-auth-token にも保存されています。');
+  console.log('LAN上の他端末からアクセスする場合、アプリ画面で入力してください。');
+  console.log('='.repeat(60));
+  app.use(createRequireAuth(() => lanAuthToken));
+}
+
+app.use(express.json({ limit: '4mb' }));
+
+if (lanMode) {
+  app.post('/api/auth/login', createLoginHandler(() => lanAuthToken));
+  app.post('/api/auth/logout', logoutHandler);
+}
+
+// 公開対象はフロントエンドが参照する frames（根拠フレーム）のみ。
+// SQLite DB / 設定 / APIトークン / 監査データ / uploads / 一時ファイル等はHTTPで公開しない。
+app.use('/media/frames', express.static(framesRoot, { index: false, dotfiles: 'ignore' }));
+
+const upload = multer({
+  dest: incoming,
+  limits: {
+    fileSize: 10 * 1024 * 1024 * 1024,
+    // このエンドポイントは`video`フィールド1件のみを受け付ける(フロントエンドもそれ以外送信しない)。
+    // 既定値は全て無制限(Infinity)のため、大量のフィールド/ファイルパートを含む
+    // multipartリクエストによるパース処理のメモリ/CPU消費を防ぐため明示的に絞る。
+    files: 1,
+    fields: 0,
+    fieldSize: 1024,
+    parts: 2,
+  },
+  // 拡張子allowlistによる一次フィルタ（実体検証は videoValidation.validateUploadedVideo で実施）
+  fileFilter: videoFileFilter,
+});
 const subscribers = new Map<string, Set<express.Response>>();
 const jobAbortControllers = new Map<string, AbortController>();
 
@@ -170,13 +280,65 @@ function resolveVideoPath(video: { id: string; path?: string; name?: string }): 
     } catch {}
   }
 
-  throw new Error(`動画ファイルが見つかりません (${video.path || video.id})。ファイルが uploads ディレクトリ内に存在するか確認してください。`);
+  console.warn(`動画ファイルが見つかりません: video_id=${video.id}, path=${video.path || '(未設定)'}`);
+  throw new Error(`動画ファイルが見つかりません (動画ID: ${video.id})。ファイルが uploads ディレクトリ内に存在するか確認してください。`);
+}
+
+// 指定動画に紐づく実行中/待機中ジョブを中断し、SSE購読者との接続を閉じる。
+// subscribers/jobAbortControllers はジョブID(jobs.id)をキーとするため、
+// 必ずjobsテーブルから実際のジョブIDを引いてから操作する(動画IDをそのままキーに使わない)。
+function abortAndCleanupJobsForVideo(videoId: string): void {
+  const jobs = db.prepare('SELECT id FROM jobs WHERE video_id=?').all(videoId) as { id: string }[];
+  for (const { id: jobId } of jobs) {
+    const controller = jobAbortControllers.get(jobId);
+    if (controller) {
+      controller.abort();
+      jobAbortControllers.delete(jobId);
+    }
+    const subs = subscribers.get(jobId);
+    if (subs) {
+      for (const stream of subs) {
+        try { stream.end(); } catch {}
+      }
+      subscribers.delete(jobId);
+    }
+  }
+}
+
+// 動画本体のファイルと抽出フレーム画像ディレクトリを削除する。
+// resolveVideoPath()はbasename()による正規化を経由するため、videoレコードの
+// pathフィールドに何が入っていてもuploadsディレクトリ外へは到達しない。
+function deleteVideoFilesAndFrames(video: { id: string; path?: string; name?: string }): void {
+  try {
+    const resolvedPath = resolveVideoPath(video);
+    if (existsSync(resolvedPath)) rmSync(resolvedPath);
+  } catch {}
+  const frameDir = join(framesRoot, video.id);
+  if (existsSync(frameDir)) rmSync(frameDir, { recursive: true, force: true });
+}
+
+// DoS対策: 同時実行中の解析/報告書生成ジョブ数に上限を設ける。
+// jobAbortControllersは実行中ジョブでのみエントリを持つため、そのサイズがそのまま
+// 現在の同時実行数になる(analyze()/generateReport()のfinallyで必ず削除される)。
+const MAX_CONCURRENT_JOBS = Number(process.env.MAX_CONCURRENT_JOBS) > 0 ? Number(process.env.MAX_CONCURRENT_JOBS) : 3;
+
+function isAtConcurrentJobLimit(): boolean {
+  return jobAbortControllers.size >= MAX_CONCURRENT_JOBS;
+}
+
+// 同一動画に対して既に実行中/待機中のジョブが無いかを確認する。
+// 同じ動画へ解析・報告書生成を多重起動すると、events/reportsへの書き込みが競合し
+// データが壊れるうえ、無制限にffmpeg/AI呼び出しを積み増せてしまう。
+function hasActiveJobForVideo(videoId: string): boolean {
+  const active = db.prepare("SELECT 1 FROM jobs WHERE video_id=? AND status IN ('queued','running') LIMIT 1").get(videoId);
+  return !!active;
 }
 
 function probeDuration(videoPath: string): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     if (!existsSync(videoPath)) {
-      return reject(new Error(`動画ファイルが見つかりません: ${videoPath}`));
+      console.warn(`動画ファイルが見つかりません: ${videoPath}`);
+      return reject(new Error('動画ファイルが見つかりません。ファイルがuploadsディレクトリ内に存在するか確認してください。'));
     }
     const p = spawn('ffprobe', [
       '-v',
@@ -197,7 +359,8 @@ function probeDuration(videoPath: string): Promise<number> {
         const dur = Number(stdout.trim());
         resolve(Number.isFinite(dur) && dur > 0 ? dur : 0);
       } else {
-        reject(new Error(`ffprobeを実行できませんでした (終了コード ${code}): ${stderr.trim() || '動画情報を取得できませんでした'}`));
+        if (stderr.trim()) console.warn(`ffprobeエラー(動画: ${videoPath}):`, stderr.trim());
+        reject(new Error(`ffprobeを実行できませんでした (終了コード ${code}): ${redactAbsolutePaths(stderr.trim()) || '動画情報を取得できませんでした'}`));
       }
     });
   });
@@ -209,7 +372,11 @@ function command(bin: string, args: string[]) {
     let err = '';
     p.stderr.on('data', d => err += d);
     p.on('error', errObj => reject(new Error(`${bin}の起動に失敗しました: ${errObj.message}`)));
-    p.on('close', code => code === 0 ? resolve(err) : reject(new Error(`${bin}の実行に失敗しました (終了コード ${code}): ${err.trim() || `${bin} failed`}`)));
+    p.on('close', code => {
+      if (code === 0) return resolve(err);
+      if (err.trim()) console.warn(`${bin}エラー(引数: ${args.join(' ')}):`, err.trim());
+      reject(new Error(`${bin}の実行に失敗しました (終了コード ${code}): ${redactAbsolutePaths(err.trim()) || `${bin} failed`}`));
+    });
   });
 }
 
@@ -309,6 +476,7 @@ async function analyze(
       checkAbort();
       updateJob(jobId, 10, '代表フレームを抽出しています');
       mkdirSync(folder, { recursive: true });
+      hardenPermissions([folder], DIR_MODE);
 
       // 既存フレームのクリーンアップ
       const existing = readdirSync(folder);
@@ -316,8 +484,12 @@ async function analyze(
         try { rmSync(join(folder, f)); } catch {}
       }
 
-      // 証跡・フォールバック用フレーム抽出
-      const count = Math.max(6, Math.ceil(duration / 15));
+      // 証跡・フォールバック用フレーム抽出。1区間30秒あたり6フレーム(=5秒に1フレーム)を
+      // 基本密度とする。30秒に満たない短い動画でも根拠フレームを最低6枚は確保するため、
+      // その場合は動画全体に均等配置されるよう間隔を狭める(例: 12秒の動画なら2秒間隔で6枚)。
+      const TARGET_FRAME_INTERVAL_SEC = 5;
+      const MIN_FRAME_COUNT = 6;
+      const count = Math.max(MIN_FRAME_COUNT, Math.ceil(duration / TARGET_FRAME_INTERVAL_SEC));
       interval = Math.max(1, duration / count);
       await command('ffmpeg', [
         '-y',
@@ -753,23 +925,35 @@ app.put('/api/settings', (req, res) => {
 
   for (const p of getAllProviders()) {
     const pid = p.id;
-    if (typeof b[`${pid}_url`] === 'string') setSetting(`${pid}_url`, b[`${pid}_url`]);
+    if (typeof b[`${pid}_url`] === 'string' && b[`${pid}_url`].trim()) {
+      const val = validateProviderUrl(pid, b[`${pid}_url`]);
+      if (!val.valid || !val.normalizedUrl) {
+        return res.status(400).json({ error: `${p.name} のURLが無効です: ${val.error}` });
+      }
+      setSetting(`${pid}_url`, val.normalizedUrl);
+    }
     if (typeof b[`${pid}_model`] === 'string') setSetting(`${pid}_model`, b[`${pid}_model`]);
     if (typeof b[`${pid}_token`] === 'string' && b[`${pid}_token`].trim()) {
-      setSetting(`${pid}_token`, b[`${pid}_token`].trim());
+      setProviderToken(pid, b[`${pid}_token`].trim());
     }
     if (b[`clear_${pid}_token`] === true) {
-      setSetting(`${pid}_token`, '');
+      setProviderToken(pid, '');
     }
   }
 
   // ネストされた provider_settings からの保存もサポート
   if (b.provider_settings && typeof b.provider_settings === 'object') {
     for (const [pid, ps] of Object.entries(b.provider_settings) as [string, any][]) {
-      if (typeof ps.url === 'string') setSetting(`${pid}_url`, ps.url);
+      if (typeof ps.url === 'string' && ps.url.trim()) {
+        const val = validateProviderUrl(pid as ProviderId, ps.url);
+        if (!val.valid || !val.normalizedUrl) {
+          return res.status(400).json({ error: `プロバイダー(${pid})のURLが無効です: ${val.error}` });
+        }
+        setSetting(`${pid}_url`, val.normalizedUrl);
+      }
       if (typeof ps.model === 'string') setSetting(`${pid}_model`, ps.model);
-      if (typeof ps.token === 'string' && ps.token.trim()) setSetting(`${pid}_token`, ps.token.trim());
-      if (ps.clear_token === true) setSetting(`${pid}_token`, '');
+      if (typeof ps.token === 'string' && ps.token.trim()) setProviderToken(pid as ProviderId, ps.token.trim());
+      if (ps.clear_token === true) setProviderToken(pid as ProviderId, '');
     }
   }
 
@@ -781,11 +965,17 @@ app.post('/api/providers/:id/test', async (req, res) => {
   const pid = req.params.id as ProviderId;
   try {
     const provider = getProvider(pid);
+    const requestedUrl = (typeof req.body.url === 'string' && req.body.url.trim()) ? req.body.url.trim() : getSetting(`${pid}_url`, provider.defaultBaseUrl);
+    const val = validateProviderUrl(pid, requestedUrl);
+    if (!val.valid || !val.normalizedUrl) {
+      return res.status(400).json({ error: `${provider.name} のURL検証エラー: ${val.error}` });
+    }
+
     const config: ProviderConfig = {
       id: pid,
       name: provider.name,
-      baseUrl: (typeof req.body.url === 'string' && req.body.url.trim()) ? req.body.url.trim() : getSetting(`${pid}_url`, provider.defaultBaseUrl),
-      token: (typeof req.body.token === 'string' && req.body.token.trim()) ? req.body.token.trim() : getSetting(`${pid}_token`, ''),
+      baseUrl: val.normalizedUrl,
+      token: (typeof req.body.token === 'string' && req.body.token.trim()) ? req.body.token.trim() : getProviderToken(pid),
       model: (typeof req.body.model === 'string' && req.body.model.trim()) ? req.body.model.trim() : getSetting(`${pid}_model`, provider.defaultModel),
     };
 
@@ -805,11 +995,17 @@ app.post('/api/providers/:id/test', async (req, res) => {
 app.post('/api/lmstudio/test', async (req, res) => {
   try {
     const provider = getProvider('lmstudio');
+    const requestedUrl = getSetting('lmstudio_url', provider.defaultBaseUrl);
+    const val = validateProviderUrl('lmstudio', requestedUrl);
+    if (!val.valid || !val.normalizedUrl) {
+      return res.status(400).json({ error: `LM Studio のURL検証エラー: ${val.error}` });
+    }
+
     const config: ProviderConfig = {
       id: 'lmstudio',
       name: 'LM Studio',
-      baseUrl: getSetting('lmstudio_url', provider.defaultBaseUrl),
-      token: getSetting('lmstudio_token', ''),
+      baseUrl: val.normalizedUrl,
+      token: getProviderToken('lmstudio'),
       model: getSetting('lmstudio_model', ''),
     };
     const result = await provider.testConnection(config);
@@ -835,19 +1031,66 @@ app.get('/api/projects/:id', (req, res) => {
   res.json({ project, videos: db.prepare('SELECT * FROM videos WHERE project_id=? ORDER BY created_at DESC').all(req.params.id) });
 });
 
-app.post('/api/projects/:id/videos', upload.single('video'), (req, res) => {
+app.post('/api/projects/:id/videos', (req, _res, next) => {
+  // 大容量動画(最大10GB)は低速な接続では受信に時間がかかるため、
+  // アイドルタイムアウト(server.on('connection', ...)参照)の対象から除外する。
+  // multerがボディを読み始める前に設定する必要がある。
+  req.socket.setTimeout(0);
+  next();
+}, upload.single('video'), async (req, res) => {
   const projectId = String(req.params.id);
   if (!req.file) return res.status(400).json({ error: '動画を選択してください' });
   const project = db.prepare('SELECT 1 FROM projects WHERE id=?').get(projectId);
-  if (!project) return res.sendStatus(404);
-  const id = randomUUID();
+  if (!project) {
+    // プロジェクトが存在しない場合は一時ファイルを削除してから返す
+    try { rmSync(req.file.path); } catch {}
+    return res.sendStatus(404);
+  }
   const name = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
-  const target = join(uploads, `${id}${extname(name).toLowerCase() || '.mp4'}`);
-  renameSync(req.file.path, target);
-  const hash = createHash('sha256').update(readFileSync(target)).digest('hex');
-  const row = { id, project_id: projectId, name, path: target, sha256: hash, duration: null, created_at: now() };
-  db.prepare('INSERT INTO videos VALUES (?,?,?,?,?,?,?)').run(row.id, row.project_id, row.name, row.path, row.sha256, row.duration, row.created_at);
-  res.status(201).json({ ...row, path: undefined });
+  const ext = extname(name).toLowerCase();
+
+  try {
+    // ファイル名・拡張子・Content-Type(mimetype)だけを信頼せず、
+    // ffprobeで実データを解析して「実際に対応形式の映像トラックを持つファイルか」を確認する。
+    await validateUploadedVideo(req.file.path, ext);
+  } catch (err: any) {
+    try { rmSync(req.file.path); } catch {}
+    const status = err instanceof VideoValidationError ? 400 : 500;
+    return res.status(status).json({ error: err.message || '動画ファイルの検証に失敗しました' });
+  }
+
+  const id = randomUUID();
+  const target = join(uploads, `${id}${ext}`);
+
+  try {
+    renameSync(req.file.path, target);
+  } catch (err: any) {
+    // rename失敗時は一時ファイルを削除
+    try { rmSync(req.file.path); } catch {}
+    return res.status(500).json({ error: `ファイルの移動に失敗しました: ${err.message}` });
+  }
+
+  let hash: string;
+  try {
+    // ストリーミングでSHA-256を計算 (readFileSyncによる全メモリ読み込みを回避)
+    const hashObj = createHash('sha256');
+    await pipeline(createReadStream(target), hashObj);
+    hash = hashObj.digest('hex');
+  } catch (err: any) {
+    // ハッシュ計算失敗時はアップロードファイルを削除
+    try { rmSync(target); } catch {}
+    return res.status(500).json({ error: `ファイルのハッシュ計算に失敗しました: ${err.message}` });
+  }
+
+  try {
+    const row = { id, project_id: projectId, name, path: target, sha256: hash, duration: null, created_at: now() };
+    db.prepare('INSERT INTO videos VALUES (?,?,?,?,?,?,?)').run(row.id, row.project_id, row.name, row.path, row.sha256, row.duration, row.created_at);
+    res.status(201).json({ ...row, path: undefined });
+  } catch (err: any) {
+    // DB挿入失敗時はアップロードファイルを削除
+    try { rmSync(target); } catch {}
+    return res.status(500).json({ error: `データベースへの登録に失敗しました: ${err.message}` });
+  }
 });
 
 app.get('/api/videos/:id', (req, res) => {
@@ -866,20 +1109,14 @@ app.delete('/api/videos/:id', (req, res) => {
   const video = db.prepare('SELECT * FROM videos WHERE id=?').get(id) as any;
   if (!video) return res.sendStatus(404);
   try {
-    try {
-      const resolvedPath = resolveVideoPath(video);
-      if (existsSync(resolvedPath)) rmSync(resolvedPath);
-    } catch {}
-    const frameDir = join(framesRoot, id);
-    if (existsSync(frameDir)) rmSync(frameDir, { recursive: true, force: true });
+    abortAndCleanupJobsForVideo(id);
+    deleteVideoFilesAndFrames(video);
     db.exec('BEGIN');
     db.prepare('DELETE FROM events WHERE video_id=?').run(id);
     db.prepare('DELETE FROM reports WHERE video_id=?').run(id);
     db.prepare('DELETE FROM jobs WHERE video_id=?').run(id);
     db.prepare('DELETE FROM videos WHERE id=?').run(id);
     db.exec('COMMIT');
-    subscribers.get(id)?.forEach(stream => stream.end());
-    subscribers.delete(id);
     res.sendStatus(204);
   } catch (error: any) {
     try { db.exec('ROLLBACK'); } catch {}
@@ -887,9 +1124,44 @@ app.delete('/api/videos/:id', (req, res) => {
   }
 });
 
+// プロジェクト削除エンドポイント: プロジェクト配下の全動画・フレーム画像・イベント・
+// 報告書・ジョブを含めて完全に削除する(不可逆操作)。
+app.delete('/api/projects/:id', (req, res) => {
+  const id = String(req.params.id);
+  const project = db.prepare('SELECT * FROM projects WHERE id=?').get(id) as any;
+  if (!project) return res.sendStatus(404);
+
+  const videos = db.prepare('SELECT * FROM videos WHERE project_id=?').all(id) as any[];
+  try {
+    for (const video of videos) {
+      abortAndCleanupJobsForVideo(video.id);
+      deleteVideoFilesAndFrames(video);
+    }
+    db.exec('BEGIN');
+    for (const video of videos) {
+      db.prepare('DELETE FROM events WHERE video_id=?').run(video.id);
+      db.prepare('DELETE FROM reports WHERE video_id=?').run(video.id);
+      db.prepare('DELETE FROM jobs WHERE video_id=?').run(video.id);
+    }
+    db.prepare('DELETE FROM videos WHERE project_id=?').run(id);
+    db.prepare('DELETE FROM projects WHERE id=?').run(id);
+    db.exec('COMMIT');
+    res.sendStatus(204);
+  } catch (error: any) {
+    try { db.exec('ROLLBACK'); } catch {}
+    res.status(500).json({ error: `プロジェクトを削除できませんでした: ${error.message}` });
+  }
+});
+
 app.post('/api/videos/:id/analyze', (req, res) => {
-  const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id);
+  const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id) as any;
   if (!video) return res.sendStatus(404);
+  if (hasActiveJobForVideo(video.id)) {
+    return res.status(409).json({ error: 'この動画は既に解析中/待機中です。完了または中断してから再実行してください。' });
+  }
+  if (isAtConcurrentJobLimit()) {
+    return res.status(429).json({ error: `同時実行中のジョブ数が上限(${MAX_CONCURRENT_JOBS}件)に達しています。しばらく待ってから再試行してください。` });
+  }
   const job = {
     id: randomUUID(),
     video_id: req.params.id,
@@ -948,10 +1220,16 @@ app.get('/api/jobs/:id/stream', (req, res) => {
 
 // 報告書生成エンドポイント
 app.post('/api/videos/:id/report', (req, res) => {
-  const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id);
+  const video = db.prepare('SELECT * FROM videos WHERE id=?').get(req.params.id) as any;
   if (!video) return res.sendStatus(404);
   const events = db.prepare('SELECT 1 FROM events WHERE video_id=? LIMIT 1').get(req.params.id);
   if (!events) return res.status(400).json({ error: '先にイベントを解析してください' });
+  if (hasActiveJobForVideo(video.id)) {
+    return res.status(409).json({ error: 'この動画は既に処理中です。完了または中断してから再実行してください。' });
+  }
+  if (isAtConcurrentJobLimit()) {
+    return res.status(429).json({ error: `同時実行中のジョブ数が上限(${MAX_CONCURRENT_JOBS}件)に達しています。しばらく待ってから再試行してください。` });
+  }
 
   const job = {
     id: randomUUID(),
@@ -1019,6 +1297,12 @@ app.post('/api/jobs/:id/resume', (req, res) => {
 
   const video = db.prepare('SELECT * FROM videos WHERE id=?').get(pausedJob.video_id) as any;
   if (!video) return res.sendStatus(404);
+  if (hasActiveJobForVideo(video.id)) {
+    return res.status(409).json({ error: 'この動画は既に処理中です。完了または中断してから再実行してください。' });
+  }
+  if (isAtConcurrentJobLimit()) {
+    return res.status(429).json({ error: `同時実行中のジョブ数が上限(${MAX_CONCURRENT_JOBS}件)に達しています。しばらく待ってから再試行してください。` });
+  }
 
   let state: any = null;
   if (pausedJob.state_json) {
@@ -1084,9 +1368,40 @@ const dist = join(root, 'dist');
 if (existsSync(dist)) app.use(express.static(dist));
 app.get(/.*/, (_req, res) => existsSync(dist) ? res.sendFile(join(dist, 'index.html')) : res.status(404).send('フロントエンドを起動するには npm run dev を使用してください。'));
 
-const port = Number(process.env.PORT || 5173);
-const server = app.listen(port, () => console.log(`Video Scripter: http://localhost:${port}`));
+// Multerエラーハンドラー: ファイルサイズ超過等の場合に一時ファイルを確実に削除してからエラーを返す
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  // multerが書き込んだ一時ファイルを確実に削除
+  const file = (req as any).file as Express.Multer.File | undefined;
+  if (file?.path) {
+    try { rmSync(file.path); } catch {}
+  }
+  if (err?.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: `ファイルサイズが上限（10GB）を超えています` });
+  }
+  if (err?.code?.startsWith('LIMIT_')) {
+    return res.status(400).json({ error: `アップロードエラー: ${err.message || err.code}` });
+  }
+  if (err instanceof VideoValidationError) {
+    return res.status(400).json({ error: err.message });
+  }
+  return res.status(500).json({ error: err.message || 'サーバーエラーが発生しました' });
+});
 
-server.requestTimeout = 0;
-server.headersTimeout = 0;
+const server = app.listen(port, host, () => console.log(`Video Scripter: http://${host}:${port}`));
+
+// Slowloris型DoS対策: 接続がCONNECTION_IDLE_TIMEOUT_MSの間まったくデータを
+// やり取りしない場合、そのソケットを強制的に閉じる。
+// 注: server.requestTimeout/headersTimeoutはNode.jsのドキュメント上は同様の役割を持つが、
+// 実行環境で検証したところ機能しなかったため(スロー送信・完全な沈黙のいずれでも
+// タイムアウトが発火しないことを実測で確認済み)、より低レベルで確実に動作する
+// socket.setTimeout()を用いた独自の仕組みで代替する。
+// アイドル(無通信)時間のみを見るため、低速だが継続的なアップロード(最大10GB)を妨げない。
+// SSE配信(/api/jobs/:id/stream)と動画アップロード(/api/projects/:id/videos)は
+// 個別に req.socket.setTimeout(0) でこの制限から除外している。
+const CONNECTION_IDLE_TIMEOUT_MS = 120_000;
+server.on('connection', socket => {
+  socket.setTimeout(CONNECTION_IDLE_TIMEOUT_MS);
+  socket.on('timeout', () => socket.destroy());
+});
 server.keepAliveTimeout = 120000;

@@ -158,6 +158,35 @@ aside h3 {
     font-size: 11px;
 }
 
+.project-row {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+    margin: 2px 0;
+}
+
+.project-row .project {
+    flex: 1;
+    margin: 0;
+    min-width: 0;
+}
+
+.project-delete {
+    flex: none;
+    width: 30px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: #b7bfd1;
+    font-size: 13px;
+}
+
+.project-delete:hover {
+    color: #c65252;
+    border-color: transparent;
+    background: #fbeaea;
+}
+
 /* サイドバー: プロバイダー一覧 */
 .provider-status-list {
     display: flex;
@@ -1166,4 +1195,49 @@ aside h3 {
     .profile-cards-grid {
         grid-template-columns: 1fr;
     }
+}
+
+.lan-auth-gate {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+
+.lan-auth-card {
+    width: 100%;
+    max-width: 360px;
+    background: #fff;
+    border: 1px solid #d8ddea;
+    border-radius: 12px;
+    padding: 28px;
+    text-align: center;
+}
+
+.lan-auth-card h1 {
+    margin: 0 0 8px;
+    font-size: 20px;
+}
+
+.lan-auth-card p {
+    margin: 0 0 14px;
+    color: #56628a;
+}
+
+.lan-auth-card .hint {
+    font-size: 12px;
+}
+
+.lan-auth-card input {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid #d8ddea;
+    border-radius: 8px;
+    margin-bottom: 12px;
+}
+
+.lan-auth-error {
+    color: #c65252;
+    font-weight: 500;
 }

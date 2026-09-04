@@ -3,21 +3,24 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.13.0" },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev": "tsx watch server/index.ts",
     "build": "vite build && tsc -p tsconfig.server.json",
-    "start": "node dist-server/index.js"
+    "start": "node dist-server/index.js",
+    "test": "node --import tsx --test \"server/**/*.test.ts\""
   },
   "dependencies": {
     "express": "^5.1.0",
-    "multer": "^2.0.2",
+    "multer": "^2.3.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
-    "@types/multer": "^2.0.0",
+    "@types/multer": "^2.2.0",
     "@types/node": "^24.3.0",
     "@types/react": "^19.1.11",
     "@types/react-dom": "^19.1.9",

@@ -38,8 +38,17 @@ type ProfileMeta = {
   defaultCustomReportPrompt?: string;
 };
 
+// LAN公開モードで401(未認証)を受け取った際に呼び出されるコールバック。
+// App側でuseEffectを通じて登録し、ログイン画面への切り替えに使う。
+let onUnauthorized: (() => void) | null = null;
+
 const api = async (path: string, init?: RequestInit) => {
-  const r = await fetch('/api' + path, init);
+  const headers = { ...(init?.headers as Record<string, string> | undefined), 'X-Requested-With': 'video-scripter' };
+  const r = await fetch('/api' + path, { ...init, headers });
+  if (r.status === 401) {
+    onUnauthorized?.();
+    throw new Error('LAN経由でのアクセスには認証が必要です。');
+  }
   if (!r.ok) {
     const j = await r.json().catch(() => ({}));
     throw new Error(j.error || `通信エラー (${r.status})`);
@@ -93,6 +102,12 @@ function App() {
   // 再開用に最後の解析オプションを保持
   const [lastAnalyzeOptions, setLastAnalyzeOptions] = useState<any>(null);
 
+  // LAN公開モード: 未認証(401)を検知したらログイン画面に切り替える
+  const [needsLanAuth, setNeedsLanAuth] = useState(false);
+  const [lanAuthToken, setLanAuthToken] = useState('');
+  const [lanAuthError, setLanAuthError] = useState('');
+  const [lanAuthSubmitting, setLanAuthSubmitting] = useState(false);
+
   const activeStreamRef = useRef<EventSource | null>(null);
 
   const current = useMemo(() => videos.find(v => v.id === videoId), [videos, videoId]);
@@ -133,6 +148,36 @@ function App() {
       }
     } catch {}
   }, []);
+
+  useEffect(() => {
+    onUnauthorized = () => setNeedsLanAuth(true);
+    return () => { onUnauthorized = null; };
+  }, []);
+
+  const submitLanAuthToken = async () => {
+    if (!lanAuthToken.trim()) return;
+    setLanAuthSubmitting(true);
+    setLanAuthError('');
+    try {
+      const r = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'video-scripter' },
+        body: JSON.stringify({ token: lanAuthToken.trim() }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        setLanAuthError(j.error || `ログインに失敗しました (${r.status})`);
+        return;
+      }
+      setNeedsLanAuth(false);
+      setLanAuthToken('');
+      window.location.reload();
+    } catch (e: any) {
+      setLanAuthError(e.message || 'ログインに失敗しました');
+    } finally {
+      setLanAuthSubmitting(false);
+    }
+  };
 
   useEffect(() => {
     refreshProjects();
@@ -267,6 +312,28 @@ function App() {
     const p = await api('/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
     await refreshProjects();
     openProject(p.id);
+  };
+
+  const deleteProject = async (p: Project) => {
+    const ok = window.confirm(
+      `プロジェクト「${p.name}」を削除しますか？\n含まれる動画${p.video_count}本・解析イベント・報告書もすべて完全に削除されます。この操作は取り消せません。`
+    );
+    if (!ok) return;
+    try {
+      await api('/projects/' + p.id, { method: 'DELETE' });
+      if (selected === p.id) {
+        closeStream();
+        setSelected(undefined);
+        setVideoId(undefined);
+        setVideos([]);
+        setEvents([]);
+        setJob(undefined);
+      }
+      await refreshProjects();
+      setMessage(`プロジェクト「${p.name}」を削除しました。`);
+    } catch (e: any) {
+      setMessage(e.message);
+    }
   };
 
   const upload = async (file: File) => {
@@ -464,6 +531,30 @@ function App() {
   const activeProfileDef = profilesMeta.find(p => p.id === executionProfile) || profilesMeta[0];
   const activeProviderDef = providersMeta.find(p => p.id === executionProvider) || providersMeta[0];
 
+  if (needsLanAuth) {
+    return (
+      <main className="lan-auth-gate">
+        <div className="lan-auth-card">
+          <h1>▶ Video Scripter</h1>
+          <p>LAN経由でのアクセスには認証トークンが必要です。</p>
+          <p className="hint">トークンは本体PCのコンソール、または <code>data/lan-auth-token</code> ファイルで確認できます。</p>
+          <input
+            type="password"
+            autoFocus
+            placeholder="アクセストークンを入力"
+            value={lanAuthToken}
+            onChange={e => setLanAuthToken(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') submitLanAuthToken(); }}
+          />
+          {lanAuthError && <p className="lan-auth-error">{lanAuthError}</p>}
+          <button className="primary full" disabled={lanAuthSubmitting || !lanAuthToken.trim()} onClick={submitLanAuthToken}>
+            {lanAuthSubmitting ? '確認中…' : 'ログイン'}
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main>
       <header>
@@ -490,10 +581,19 @@ function App() {
           <h3>プロジェクト</h3>
           {projects.length === 0 && <p className="muted">プロジェクトを作成して動画を追加します。</p>}
           {projects.map(p => (
-            <button key={p.id} className={'project ' + (selected === p.id ? 'active' : '')} onClick={() => openProject(p.id)}>
-              <b>{p.name}</b>
-              <small>{p.video_count} 本の動画</small>
-            </button>
+            <div key={p.id} className="project-row">
+              <button className={'project ' + (selected === p.id ? 'active' : '')} onClick={() => openProject(p.id)}>
+                <b>{p.name}</b>
+                <small>{p.video_count} 本の動画</small>
+              </button>
+              <button
+                className="project-delete"
+                title="プロジェクトを削除"
+                onClick={e => { e.stopPropagation(); deleteProject(p); }}
+              >
+                ✕
+              </button>
+            </div>
           ))}
 
           <hr />

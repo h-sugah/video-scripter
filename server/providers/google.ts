@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, openAsBlob } from 'node:fs';
 import { join } from 'node:path';
 import type {
   AIProvider,
@@ -7,7 +7,13 @@ import type {
   VideoDirectParams,
   TextGenerationParams,
 } from './types.js';
+import { validateProviderUrl, validateGoogleUploadUrl } from './validator.js';
+import { createFetchTimeout, combineSignals, CONNECT_TEST_TIMEOUT_MS, RESPONSE_START_TIMEOUT_MS } from './utils.js';
 
+// 注意: このファイルはGemini APIキーをURLクエリパラメータ(?key=...)で送信している(Google側のREST API仕様上の要求)。
+// URLに秘密情報が乗るため、将来HTTPアクセスログ・デバッグログ・プロキシログ等を追加する際は、
+// このファイルが送信するリクエストURLをそのまま記録しないよう注意すること
+// (現状このファイル・呼び出し元にconsole.log等でURLを出力する箇所は無い)。
 export class GoogleGeminiProvider implements AIProvider {
   readonly id = 'google' as const;
   readonly name = 'Google (Gemini)';
@@ -24,18 +30,35 @@ export class GoogleGeminiProvider implements AIProvider {
     'gemini-3.6-pro',
   ];
 
+  private getValidatedBaseUrl(baseUrl?: string): string {
+    const raw = baseUrl || this.defaultBaseUrl;
+    const val = validateProviderUrl('google', raw);
+    if (!val.valid || !val.normalizedUrl) {
+      throw new Error(`Gemini URL検証エラー: ${val.error}`);
+    }
+    return val.normalizedUrl;
+  }
+
   private getCleanModel(modelName: string): string {
     return (modelName || this.defaultModel).replace(/^models\//, '').trim();
   }
 
   async testConnection(config: ProviderConfig): Promise<{ models: string[] }> {
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('Google Gemini APIキーを入力してください');
 
-    const res = await fetch(`${base}/v1beta/models?key=${encodeURIComponent(token)}`, {
-      keepalive: true,
-    });
+    const fetchTimeout = createFetchTimeout(CONNECT_TEST_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${base}/v1beta/models?key=${encodeURIComponent(token)}`, {
+        keepalive: true,
+        redirect: 'error',
+        signal: fetchTimeout.signal,
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -53,7 +76,7 @@ export class GoogleGeminiProvider implements AIProvider {
 
   async analyzeVisionBatch(params: VisionBatchParams): Promise<string> {
     const { config, prompt, batchFiles, folder, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('Google Gemini APIキーが設定されていません');
     const model = this.getCleanModel(config.model);
@@ -70,19 +93,26 @@ export class GoogleGeminiProvider implements AIProvider {
     }
 
     const url = `${base}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?key=${encodeURIComponent(token)}&alt=sse`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      keepalive: true,
-      signal,
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 8192,
-        },
-      }),
-    });
+    const fetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        keepalive: true,
+        redirect: 'error',
+        signal: combineSignals(signal, fetchTimeout.signal),
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 8192,
+          },
+        }),
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -94,7 +124,7 @@ export class GoogleGeminiProvider implements AIProvider {
 
   async analyzeVideoDirect(params: VideoDirectParams): Promise<string> {
     const { config, prompt, videoPath, videoName, mimeType, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('Google Gemini APIキーが設定されていません');
     const model = this.getCleanModel(config.model);
@@ -106,35 +136,51 @@ export class GoogleGeminiProvider implements AIProvider {
 
     // 1. Resumable Upload セッション開始
     const uploadInitUrl = `${base}/upload/v1beta/files?key=${encodeURIComponent(token)}`;
-    const initRes = await fetch(uploadInitUrl, {
-      method: 'POST',
-      headers: {
-        'X-Goog-Upload-Protocol': 'resumable',
-        'X-Goog-Upload-Command': 'start',
-        'X-Goog-Upload-Header-Content-Length': String(fileSize),
-        'X-Goog-Upload-Header-Content-Type': mimeType || 'video/mp4',
-        'Content-Type': 'application/json',
-      },
-      signal,
-      body: JSON.stringify({
-        file: {
-          display_name: videoName,
+    const initFetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+    let initRes: Response;
+    try {
+      initRes = await fetch(uploadInitUrl, {
+        method: 'POST',
+        headers: {
+          'X-Goog-Upload-Protocol': 'resumable',
+          'X-Goog-Upload-Command': 'start',
+          'X-Goog-Upload-Header-Content-Length': String(fileSize),
+          'X-Goog-Upload-Header-Content-Type': mimeType || 'video/mp4',
+          'Content-Type': 'application/json',
         },
-      }),
-    });
+        redirect: 'error',
+        signal: combineSignals(signal, initFetchTimeout.signal),
+        body: JSON.stringify({
+          file: {
+            display_name: videoName,
+          },
+        }),
+      });
+    } finally {
+      initFetchTimeout.clear();
+    }
 
     if (!initRes.ok) {
       const err = await initRes.json().catch(() => ({}));
       throw new Error(`Gemini アップロード初期化エラー (${initRes.status}): ${err.error?.message || initRes.statusText}`);
     }
 
-    const uploadUrl = initRes.headers.get('x-goog-upload-url');
-    if (!uploadUrl) {
+    const rawUploadUrl = initRes.headers.get('x-goog-upload-url');
+    if (!rawUploadUrl) {
       throw new Error('Gemini アップロード用URLを取得できませんでした');
     }
 
-    // 2. 実データのアップロード
-    const videoBuffer = readFileSync(videoPath);
+    const uploadUrlVal = validateGoogleUploadUrl(rawUploadUrl);
+    if (!uploadUrlVal.valid || !uploadUrlVal.normalizedUrl) {
+      throw new Error(`Gemini アップロードURL検証エラー: ${uploadUrlVal.error}`);
+    }
+    const uploadUrl = uploadUrlVal.normalizedUrl;
+
+    // 2. 実データのアップロード (openAsBlobでストリーミング送信 — 巨大ファイルをメモリへ全量読み込まない)
+    // 注意: このfetchは動画本体(最大10GB)の送信が完了するまで解決しないため、
+    // 他の呼び出しと違って接続タイムアウトを付与しない(低速回線での大容量アップロードを妨げないため)。
+    // 中断はユーザーのキャンセル操作(signal)でのみ行う。
+    const videoBlob = await openAsBlob(videoPath, { type: mimeType || 'video/mp4' });
     const uploadRes = await fetch(uploadUrl, {
       method: 'POST',
       headers: {
@@ -142,8 +188,9 @@ export class GoogleGeminiProvider implements AIProvider {
         'X-Goog-Upload-Offset': '0',
         'X-Goog-Upload-Command': 'upload, finalize',
       },
+      redirect: 'error',
       signal,
-      body: videoBuffer,
+      body: videoBlob,
     });
 
     if (!uploadRes.ok) {
@@ -168,7 +215,16 @@ export class GoogleGeminiProvider implements AIProvider {
         if (signal?.aborted) throw new DOMException('中断されました', 'AbortError');
         onProgress?.(`Gemini側で動画を解析前処理中 (${attempts + 1}秒)...`);
         await new Promise(r => setTimeout(r, 2000));
-        const checkRes = await fetch(`${base}/v1beta/${fileName}?key=${encodeURIComponent(token)}`, { signal });
+        const checkFetchTimeout = createFetchTimeout(CONNECT_TEST_TIMEOUT_MS);
+        let checkRes: Response;
+        try {
+          checkRes = await fetch(`${base}/v1beta/${fileName}?key=${encodeURIComponent(token)}`, {
+            redirect: 'error',
+            signal: combineSignals(signal, checkFetchTimeout.signal),
+          });
+        } finally {
+          checkFetchTimeout.clear();
+        }
         if (checkRes.ok) {
           const checkData = (await checkRes.json()) as any;
           state = checkData.state;
@@ -188,32 +244,39 @@ export class GoogleGeminiProvider implements AIProvider {
 
       // 4. streamGenerateContent 呼び出し
       const streamUrl = `${base}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?key=${encodeURIComponent(token)}&alt=sse`;
-      const generateRes = await fetch(streamUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        keepalive: true,
-        signal,
-        body: JSON.stringify({
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  file_data: {
-                    file_uri: fileUri,
-                    mime_type: mimeType || 'video/mp4',
+      const generateFetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+      let generateRes: Response;
+      try {
+        generateRes = await fetch(streamUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          keepalive: true,
+          redirect: 'error',
+          signal: combineSignals(signal, generateFetchTimeout.signal),
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    file_data: {
+                      file_uri: fileUri,
+                      mime_type: mimeType || 'video/mp4',
+                    },
                   },
-                },
-                { text: prompt },
-              ],
+                  { text: prompt },
+                ],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 8192,
             },
-          ],
-          generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 8192,
-          },
-        }),
-      });
+          }),
+        });
+      } finally {
+        generateFetchTimeout.clear();
+      }
 
       if (!generateRes.ok) {
         const err = await generateRes.json().catch(() => ({}));
@@ -223,35 +286,48 @@ export class GoogleGeminiProvider implements AIProvider {
       return await this.consumeGeminiStream(generateRes, () => {}, signal);
     } finally {
       // 5. 解析完了後（またはエラー・中断時）にGemini上の一時ファイルをクリーンアップ
+      // ベストエフォートの後始末のため、応答が無くても長く待たせないよう短めのタイムアウトを付ける。
+      const cleanupFetchTimeout = createFetchTimeout(CONNECT_TEST_TIMEOUT_MS);
       try {
         await fetch(`${base}/v1beta/${fileName}?key=${encodeURIComponent(token)}`, {
           method: 'DELETE',
+          redirect: 'error',
+          signal: cleanupFetchTimeout.signal,
         });
-      } catch {}
+      } catch {} finally {
+        cleanupFetchTimeout.clear();
+      }
     }
   }
 
   async generateText(params: TextGenerationParams): Promise<string> {
     const { config, prompt, onProgress, signal } = params;
-    const base = (config.baseUrl || this.defaultBaseUrl).replace(/\/$/, '');
+    const base = this.getValidatedBaseUrl(config.baseUrl);
     const token = config.token?.trim();
     if (!token) throw new Error('Google Gemini APIキーが設定されていません');
     const model = this.getCleanModel(config.model);
 
     const url = `${base}/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?key=${encodeURIComponent(token)}&alt=sse`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      keepalive: true,
-      signal,
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 8192,
-        },
-      }),
-    });
+    const fetchTimeout = createFetchTimeout(RESPONSE_START_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        keepalive: true,
+        redirect: 'error',
+        signal: combineSignals(signal, fetchTimeout.signal),
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 8192,
+          },
+        }),
+      });
+    } finally {
+      fetchTimeout.clear();
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
