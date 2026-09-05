@@ -1,5 +1,34 @@
+# 依存関係
 node_modules/
+
+# ビルド成果物
 dist/
 dist-server/
+*.tsbuildinfo
+
+# アプリケーションデータ(動画・SQLite DB・LANアクセストークン等の実行時生成物)
 data/
+
+# 環境変数
 .env
+.env.local
+.env.*.local
+
+# ログ
+*.log
+npm-debug.log*
+
+# テストカバレッジ出力
+coverage/
+
+# OSが生成するファイル
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# エディタ / IDE
+.vscode/
+.idea/
+
+# Claude Codeのローカル設定(個人環境ごとの設定は共有しない)
+.claude/settings.local.json
