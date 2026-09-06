@@ -27,6 +27,6 @@
     "@vitejs/plugin-react": "^6.1.1",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2",
-    "vite": "^7.1.5"
+    "vite": "^8.2.2"
   }
 }
