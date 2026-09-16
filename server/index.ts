@@ -144,7 +144,9 @@ function getProviderToken(providerId: ProviderId): string {
   try {
     return decryptSecret(raw);
   } catch (e) {
-    console.warn(`APIトークンの復号に失敗しました (provider=${providerId}):`, e);
+    // providerIdをテンプレートリテラルでフォーマット文字列に埋め込まず、%s指定子で
+    // 別引数として渡す(CWE-134対策: フォーマット文字列自体は常に静的な値にする)。
+    console.warn('APIトークンの復号に失敗しました (provider=%s):', providerId, e);
     return '';
   }
 }
