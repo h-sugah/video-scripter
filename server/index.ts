@@ -8,6 +8,8 @@ import { join, extname, basename } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { createRateLimiter } from './rateLimit.js';
+
 import {
   getProvider,
   getAllProviders,
@@ -219,6 +221,15 @@ const upload = multer({
   // 拡張子allowlistによる一次フィルタ（実体検証は videoValidation.validateUploadedVideo で実施）
   fileFilter: videoFileFilter,
 });
+
+// 動画アップロードはハッシュ計算・ffprobe解析を伴う重い処理のため、
+// 同一接続元からの連続アップロードによるリソース枯渇を防ぐレート制限をかける。
+const videoUploadRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: 'アップロードの頻度が高すぎます。しばらく待ってから再試行してください。',
+});
+
 const subscribers = new Map<string, Set<express.Response>>();
 const jobAbortControllers = new Map<string, AbortController>();
 
@@ -917,7 +928,12 @@ app.get('/api/settings', (_req, res) => {
 app.put('/api/settings', (req, res) => {
   const b = req.body;
 
-  if (typeof b.active_provider === 'string') setSetting('active_provider', b.active_provider);
+  if (typeof b.active_provider === 'string') {
+    if (!getAllProviders().some(p => p.id === b.active_provider)) {
+      return res.status(400).json({ error: `未対応のAIプロバイダーです: ${b.active_provider}` });
+    }
+    setSetting('active_provider', b.active_provider);
+  }
   if (typeof b.active_profile === 'string') setSetting('active_profile', b.active_profile);
   if (typeof b.custom_perception_prompt === 'string') setSetting('custom_perception_prompt', b.custom_perception_prompt);
   if (typeof b.custom_report_prompt === 'string') setSetting('custom_report_prompt', b.custom_report_prompt);
@@ -944,6 +960,9 @@ app.put('/api/settings', (req, res) => {
   // ネストされた provider_settings からの保存もサポート
   if (b.provider_settings && typeof b.provider_settings === 'object') {
     for (const [pid, ps] of Object.entries(b.provider_settings) as [string, any][]) {
+      if (!getAllProviders().some(p => p.id === pid)) {
+        return res.status(400).json({ error: `未対応のAIプロバイダーです: ${pid}` });
+      }
       if (typeof ps.url === 'string' && ps.url.trim()) {
         const val = validateProviderUrl(pid as ProviderId, ps.url);
         if (!val.valid || !val.normalizedUrl) {
@@ -1031,7 +1050,7 @@ app.get('/api/projects/:id', (req, res) => {
   res.json({ project, videos: db.prepare('SELECT * FROM videos WHERE project_id=? ORDER BY created_at DESC').all(req.params.id) });
 });
 
-app.post('/api/projects/:id/videos', (req, _res, next) => {
+app.post('/api/projects/:id/videos', videoUploadRateLimiter, (req, _res, next) => {
   // 大容量動画(最大10GB)は低速な接続では受信に時間がかかるため、
   // アイドルタイムアウト(server.on('connection', ...)参照)の対象から除外する。
   // multerがボディを読み始める前に設定する必要がある。
