@@ -8,7 +8,7 @@ import { join, extname, basename } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { createRateLimiter } from './rateLimit.js';
+import { rateLimit } from 'express-rate-limit';
 
 import {
   getProvider,
@@ -135,7 +135,10 @@ for (const p of getAllProviders()) {
 }
 
 // APIトークンの読み書きは必ずこの2関数を経由し、DBには常に暗号化形式でのみ保存する。
+// providerIdは呼び出し元で検証済みの前提だが、多層防御として未知のIDはここでも弾く
+// (設定キー構築・ログ出力に外部入力をそのまま使わせないための最終防衛線)。
 function getProviderToken(providerId: ProviderId): string {
+  if (!getAllProviders().some(p => p.id === providerId)) return '';
   const raw = getSetting(`${providerId}_token`, '');
   if (!raw) return '';
   try {
@@ -224,10 +227,12 @@ const upload = multer({
 
 // 動画アップロードはハッシュ計算・ffprobe解析を伴う重い処理のため、
 // 同一接続元からの連続アップロードによるリソース枯渇を防ぐレート制限をかける。
-const videoUploadRateLimiter = createRateLimiter({
+const videoUploadRateLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 10,
-  message: 'アップロードの頻度が高すぎます。しばらく待ってから再試行してください。',
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'アップロードの頻度が高すぎます。しばらく待ってから再試行してください。' },
 });
 
 const subscribers = new Map<string, Set<express.Response>>();
