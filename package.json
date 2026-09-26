@@ -22,7 +22,7 @@
   "devDependencies": {
     "@types/express": "^5.0.3",
     "@types/multer": "^2.2.0",
-    "@types/node": "^26.5.0",
+    "@types/node": "^26.6.1",
     "@types/react": "^19.1.11",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",
